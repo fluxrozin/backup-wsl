@@ -1,0 +1,23 @@
+# ミラーリング除外パターン
+# ディレクトリは末尾に / をつける
+# ファイルはワイルドカード使用可能 (*.tmp など)
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Node.js
+node_modules/
+
+# Git
+.git/
+
+# その他
+*.tmp
+
+# ロックされる可能性のあるファイル
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
