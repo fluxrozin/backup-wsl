@@ -1,0 +1,11 @@
+# ログファイル（フォルダは管理、ファイルは除外）
+logs/*
+!logs/
+!logs/.gitkeep
+
+# 一時ファイル
+*.tmp
+
+# OS固有ファイル
+.DS_Store
+Thumbs.db

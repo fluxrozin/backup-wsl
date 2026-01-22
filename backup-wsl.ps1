@@ -46,12 +46,17 @@ if (-not $ParentDir) { $ParentDir = '/' }
 
 $MirrorDest = Join-Path $Config.DestRoot 'mirror'
 $ArchiveDest = Join-Path $Config.DestRoot 'archive'
-$LogDir = Join-Path $Config.DestRoot 'logs'
+$LogDir = Join-Path $PSScriptRoot 'logs'  # スクリプトフォルダに保存（一般的なベストプラクティス）
 $WslSource = "\\wsl.localhost\$($Config.WslDistro)" + ($Config.SourceDir -replace '/', '\')
 
 # ============================================================================
 # メイン処理
 # ============================================================================
+
+# ディレクトリ作成（ログ開始前に必要）
+New-Item -ItemType Directory -Force -Path $MirrorDest | Out-Null
+New-Item -ItemType Directory -Force -Path $ArchiveDest | Out-Null
+New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 
 # ログファイル設定
 $mainLog = Join-Path $LogDir "backup_$Timestamp.log"
@@ -91,16 +96,8 @@ if (-not (Test-Path $WslSource)) {
     Write-Log "ERROR: Source directory not found: $WslSource" 'ERROR'
     Write-Log 'Backup failed' 'ERROR'
     exit 1
-    if ($Config.SkipArchive) {
-        Write-Log 'Archive Creation: SKIPPED' 'INFO'
-    }
 }
 Write-Log 'Source directory verified' 'INFO'
-
-# ディレクトリ作成
-New-Item -ItemType Directory -Force -Path $MirrorDest | Out-Null
-New-Item -ItemType Directory -Force -Path $ArchiveDest | Out-Null
-New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 
 # [1] ミラーリング
 Write-Host '[1/3] Mirroring...' -ForegroundColor Cyan
@@ -178,9 +175,10 @@ if ($excludeFiles.Count -gt 0) {
     Write-Log "Excluding files: $($excludeFiles -join ', ')" 'INFO'
 }
 
-# エラーメッセージを一時ファイルにリダイレクトして抑制
+# エラーメッセージと標準出力を一時ファイルにリダイレクトして抑制
 $errorLog = Join-Path $env:TEMP "robocopy_error_$PID.log"
-$result = Start-Process -FilePath 'robocopy' -ArgumentList $robocopyArgs -NoNewWindow -PassThru -Wait -RedirectStandardError $errorLog
+$outputLog = Join-Path $env:TEMP "robocopy_output_$PID.log"
+$result = Start-Process -FilePath 'robocopy' -ArgumentList $robocopyArgs -NoNewWindow -PassThru -Wait -RedirectStandardError $errorLog -RedirectStandardOutput $outputLog
 $mirrorEndTime = Get-Date
 $mirrorDuration = ($mirrorEndTime - $mirrorStartTime).TotalSeconds
 
@@ -195,7 +193,15 @@ $bytesCopied = 0
 $errors = @()
 
 if (Test-Path $robocopyLog) {
-    $logContent = Get-Content $robocopyLog
+    # robocopyのログはShift-JISで出力されるため、Shift-JISとして読み込んでUTF-8に変換
+    $shiftJis = [System.Text.Encoding]::GetEncoding('shift_jis')
+    $utf8 = [System.Text.Encoding]::UTF8
+    $logBytes = [System.IO.File]::ReadAllBytes($robocopyLog)
+    $logText = $shiftJis.GetString($logBytes)
+    # UTF-8で再保存
+    [System.IO.File]::WriteAllText($robocopyLog, $logText, $utf8)
+    # 行ごとに処理
+    $logContent = $logText -split "`r?`n"
     foreach ($line in $logContent) {
         # robocopyの統計行をパース（例: "   Files :        10         5         5         0         0         0"）
         if ($line -match 'Files\s*:\s*(\d+)\s+(\d+)\s+(\d+)') {
@@ -239,6 +245,10 @@ if (Test-Path $errorLog) {
         }
     }
     Remove-Item $errorLog -Force -ErrorAction SilentlyContinue
+}
+# 標準出力ログも削除
+if (Test-Path $outputLog) {
+    Remove-Item $outputLog -Force -ErrorAction SilentlyContinue
 }
 
 Write-Log "Mirroring completed in $([math]::Round($mirrorDuration, 2)) seconds" 'INFO'

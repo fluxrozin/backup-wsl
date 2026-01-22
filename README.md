@@ -124,6 +124,7 @@ node_modules/
 - `WslDistro` は正確なディストリビューション名を指定（大文字小文字を区別）
 - `KeepDays`: `0` に設定するとアーカイブの自動削除を無効化
 - `SkipArchive`: `$true` に設定するとアーカイブ作成をスキップ（ミラーバックアップのみ実行）
+- コマンドライン引数 `-SkipArchive` は設定ファイルの値を上書きします
 
 ## 使用方法
 
@@ -170,6 +171,8 @@ $Config = @{
 .\backup-wsl.ps1 -SkipArchive
 ```
 
+**優先順位：** コマンドライン引数は設定ファイルの値を上書きします。
+
 このオプションを使用すると：
 
 - ミラーバックアップのみを実行（高速）
@@ -179,14 +182,20 @@ $Config = @{
 
 ## ディレクトリ構造
 
-スクリプトは `DEST_ROOT` 配下に以下の構造を作成します：
+スクリプトは以下の構造を作成します：
 
 ```txt
+# バックアップ先（DEST_ROOT）
 DEST_ROOT/
 ├── mirror/                 # ソースディレクトリの同期ミラー
-├── archive/                # 圧縮アーカイブファイル
-│   └── projects_YYYYMMDD_HHMMSS.tar.gz
-└── logs/                   # ログファイル
+└── archive/                # 圧縮アーカイブファイル
+    └── projects_YYYYMMDD_HHMMSS.tar.gz
+
+# スクリプトフォルダ
+backup-wsl/
+├── backup-wsl.ps1          # スクリプト本体
+├── .mirrorignore           # 除外パターン設定
+└── logs/                   # ログファイル（スクリプトフォルダに保存）
     ├── backup_YYYYMMDD_HHMMSS.log          # メインログ
     ├── robocopy_YYYYMMDD_HHMMSS.log        # robocopyログ
     ├── tar_errors_YYYYMMDD_HHMMSS.log      # tarエラーログ
@@ -219,7 +228,7 @@ Done.
 
 ## ログ機能
 
-スクリプトは各バックアップ実行の詳細なログを `logs/` ディレクトリに記録します。
+スクリプトは各バックアップ実行の詳細なログをスクリプトフォルダの `logs/` ディレクトリに記録します（一般的なベストプラクティスに従い、スクリプトと一緒に管理されます）。
 
 ### ログファイルの種類
 
@@ -232,6 +241,7 @@ Done.
 - **`robocopy_YYYYMMDD_HHMMSS.log`**: robocopyの詳細ログ
   - 転送されたファイルの一覧
   - robocopyの統計情報
+  - robocopyはShift-JISで出力しますが、自動的にUTF-8に変換して保存されます
 
 - **`tar_errors_YYYYMMDD_HHMMSS.log`**: tarコマンドのエラー・警告
   - 読み取れなかったファイルの一覧
