@@ -1,6 +1,6 @@
 # WSL バックアップスクリプト v2.0
 
-WSL (Windows Subsystem for Linux) のディレクトリを Windows ファイルシステム（NTFS）にバックアップする商用レベルのPowerShellスクリプトです。
+WSL (Windows Subsystem for Linux) のディレクトリを Windows ファイルシステム（NTFS）にバックアップする PowerShell スクリプトです。
 
 ## 特徴
 
@@ -15,8 +15,7 @@ WSL (Windows Subsystem for Linux) のディレクトリを Windows ファイル�
 
 - **設定バリデーション**: スキーマベースの厳密な設定値検証
 - **パストラバーサル防止**: ソースパスの安全性検証
-- **ログマスキング**: 機密情報（パス、パスワード等）の自動マスキング
-- **暗号化オプション**: AES-256-CBC によるアーカイブ暗号化
+- **ログマスキング**: 機密情報（パス等）の自動マスキング
 
 ### 堅牢性機能
 
@@ -25,14 +24,8 @@ WSL (Windows Subsystem for Linux) のディレクトリを Windows ファイル�
 - **統一終了コード**: エラー種別に応じた終了コード
 - **WSLヘルスチェック**: バックアップ前のWSL状態確認
 - **ディスク容量チェック**: 必要な空き容量の事前確認
-- **アーカイブ整合性検証**: 作成したアーカイブの検証
-- **チェックサム保存**: SHA256による長期整合性検証
-
-### 効率性機能
-
-- **増分アーカイブ**: 変更ファイルのみをアーカイブ
-- **圧縮レベル設定**: 速度と圧縮率のバランス調整
-- **帯域制限**: ネットワーク負荷の制御
+- **アーカイブ整合性検証**: 作成したアーカイブの gzip 検証
+- **チェックサム保存**: SHA256 による長期整合性検証
 
 ### 実用性機能
 
@@ -40,34 +33,30 @@ WSL (Windows Subsystem for Linux) のディレクトリを Windows ファイル�
 - **変更レポート**: 新規・変更・削除ファイルの一覧出力
 - **リストア機能**: アーカイブからの復元
 - **タスクスケジューラー連携**: 自動実行の設定
-- **通知機能**: Windows通知、Webhook、メール通知
+- **通知機能**: Windows 通知、Webhook（Slack / Discord / Teams 等）
+- **帯域制限**: ネットワーク負荷の制御
 
 ## 必要な環境
 
 - Windows 10/11
 - PowerShell 5.1 以上
 - WSL (Windows Subsystem for Linux)
-- WSL内に `tar`、`gzip` コマンド
-- （暗号化使用時）WSL内に `openssl` コマンド
+- WSL 内に `tar`、`gzip` コマンド
 
 ### オプション
 
-- **TOML設定**: `PSToml` モジュール
-- **YAML設定**: `powershell-yaml` モジュール
 - **テスト実行**: `Pester` モジュール
 - **高機能通知**: `BurntToast` モジュール
 
 ```powershell
 # オプションモジュールのインストール
-Install-Module -Name PSToml -Scope CurrentUser
-Install-Module -Name powershell-yaml -Scope CurrentUser
 Install-Module -Name Pester -Force -SkipPublisherCheck
 Install-Module -Name BurntToast -Scope CurrentUser
 ```
 
 ## クイックスタート
 
-### 1. 設定ファイルの作成
+### 1. 設定ファイルの編集
 
 `config.psd1` を編集して設定をカスタマイズ:
 
@@ -98,7 +87,6 @@ Install-Module -Name BurntToast -Scope CurrentUser
 | `-SkipArchive` | アーカイブ作成をスキップ（ミラーリングのみ） |
 | `-DryRun` | 実際には実行せず、何が行われるかを表示 |
 | `-Source <path>` | バックアップするソースを指定（設定より優先） |
-| `-Incremental` | 増分アーカイブを作成 |
 | `-TimeoutMinutes <n>` | タイムアウト時間（デフォルト: 120分） |
 
 ### リストアモード
@@ -136,9 +124,6 @@ Install-Module -Name BurntToast -Scope CurrentUser
 # ドライランモード
 .\backup-wsl.ps1 -DryRun
 
-# 増分アーカイブ
-.\backup-wsl.ps1 -Incremental
-
 # 特定のディレクトリのみ
 .\backup-wsl.ps1 -Source "/home/user/important"
 
@@ -158,14 +143,9 @@ Install-Module -Name BurntToast -Scope CurrentUser
 .\backup-wsl.ps1 -TestExclusions
 ```
 
-## 設定ファイル
+## 設定ファイル（config.psd1）
 
-### 対応形式（優先順位順）
-
-1. `config.json` - JSON形式（標準）
-2. `config.psd1` - PowerShell Data形式（標準、コメント可）
-3. `config.toml` - TOML形式（要モジュール）
-4. `config.yaml` / `config.yml` - YAML形式（要モジュール）
+スクリプトと同じディレクトリに配置する PowerShell Data 形式の設定ファイルです。
 
 ### 設定項目一覧
 
@@ -173,57 +153,39 @@ Install-Module -Name BurntToast -Scope CurrentUser
 
 | 項目 | 型 | デフォルト | 説明 |
 |------|-----|---------|------|
-| `WslDistro` | string | `Ubuntu` | WSLディストリビューション名 |
+| `WslDistro` | string | `Ubuntu` | WSLディストリビューション名（必須） |
 | `Sources` | array | - | バックアップ元ディレクトリ（必須） |
 | `DestRoot` | string | - | バックアップ先ルート（必須） |
 
-#### 保持期間設定
+#### 保持設定
 
 | 項目 | 型 | デフォルト | 説明 |
 |------|-----|---------|------|
-| `KeepDays` | int | `15` | アーカイブ保持日数（0=無制限） |
-| `LogKeepDays` | int | `30` | ログ保持日数（0=無制限） |
+| `KeepCount` | int | `15` | アーカイブ保持個数（0=無制限） |
+| `LogKeepCount` | int | `30` | ログ保持個数（0=無制限） |
 
 #### 実行設定
 
 | 項目 | 型 | デフォルト | 説明 |
 |------|-----|---------|------|
 | `AutoElevate` | bool | `$true` | 管理者権限への自動昇格 |
-| `ThreadCount` | int | `0` | robocopyスレッド数（0=自動） |
-| `BandwidthLimitMbps` | int | `0` | 帯域制限（0=無制限） |
+| `ThreadCount` | int | `0` | robocopy スレッド数（0=自動） |
+| `BandwidthLimitMbps` | int | `0` | 帯域制限 Mbps（0=無制限） |
 
-#### 検証設定
+#### ディスク・検証設定
 
 | 項目 | 型 | デフォルト | 説明 |
 |------|-----|---------|------|
-| `RequiredFreeSpaceGB` | int | `10` | 必要空き容量（GB） |
+| `RequiredFreeSpaceGB` | int | `10` | 必要空き容量（GB、0=チェックしない） |
 | `VerifyArchive` | bool | `$true` | アーカイブ整合性検証 |
-| `SaveChecksums` | bool | `$true` | チェックサム保存 |
-
-#### アーカイブ設定
-
-| 項目 | 型 | デフォルト | 説明 |
-|------|-----|---------|------|
-| `CompressionLevel` | int | `6` | 圧縮レベル（1-9） |
-| `IncrementalBaseDays` | int | `7` | 増分バックアップ基準日数 |
-
-#### 暗号化設定
-
-| 項目 | 型 | デフォルト | 説明 |
-|------|-----|---------|------|
-| `EnableEncryption` | bool | `$false` | 暗号化有効化 |
-| `EncryptionPassword` | string | - | 暗号化パスワード |
+| `SaveChecksums` | bool | `$true` | SHA256 チェックサム保存 |
 
 #### 通知設定
 
 | 項目 | 型 | デフォルト | 説明 |
 |------|-----|---------|------|
-| `ShowNotification` | bool | `$true` | Windows通知表示 |
-| `NotificationWebhook` | string | - | Webhook URL |
-| `NotificationEmail` | string | - | メール通知先 |
-| `SmtpServer` | string | - | SMTPサーバー |
-| `SmtpPort` | int | `587` | SMTPポート |
-| `SmtpFrom` | string | - | 送信元アドレス |
+| `ShowNotification` | bool | `$true` | Windows 通知表示 |
+| `NotificationWebhook` | string | `''` | Webhook URL（Slack / Discord 等） |
 
 #### レポート設定
 
@@ -231,7 +193,7 @@ Install-Module -Name BurntToast -Scope CurrentUser
 |------|-----|---------|------|
 | `GenerateChangeReport` | bool | `$true` | 変更レポート生成 |
 
-### 設定例（PSD1形式）
+### 設定例
 
 ```powershell
 @{
@@ -243,40 +205,22 @@ Install-Module -Name BurntToast -Scope CurrentUser
     )
     DestRoot = 'C:\Backup\WSL'
 
-    # 保持期間
-    KeepDays = 30
-    LogKeepDays = 60
+    # 保持個数
+    KeepCount = 30
+    LogKeepCount = 60
 
-    # 圧縮設定
-    CompressionLevel = 6
+    # 検証
     VerifyArchive = $true
-
-    # 暗号化（オプション）
-    EnableEncryption = $true
-    EncryptionPassword = 'your-secure-password'
+    SaveChecksums = $true
 
     # Slack通知（オプション）
     NotificationWebhook = 'https://hooks.slack.com/services/xxx/yyy/zzz'
 }
 ```
 
-### 設定例（JSON形式）
-
-```json
-{
-  "WslDistro": "Ubuntu",
-  "Sources": ["/home/user/projects"],
-  "DestRoot": "C:\\Backup\\WSL",
-  "KeepDays": 30,
-  "CompressionLevel": 6,
-  "EnableEncryption": false,
-  "NotificationWebhook": ""
-}
-```
-
 ## 除外パターン（.mirrorignore）
 
-スクリプトと同じディレクトリに `.mirrorignore` ファイルを作成:
+スクリプトと同じディレクトリに `.mirrorignore` ファイルを配置すると、ミラーリング時に指定パターンを除外できます。アーカイブ（tar.gz）には除外は適用されず、ソース全体がバックアップされます。
 
 ```txt
 # ディレクトリ（末尾に / をつける）
@@ -288,13 +232,15 @@ __pycache__/
 # ファイル（ワイルドカード使用可）
 *.pyc
 *.tmp
-*.log
 
-# 機密ファイル
-.env
-*.pem
-*.key
-credentials.json
+# ロックされる可能性のあるファイル
+*.db
+*.db-journal
+
+# IDE/エディタ
+.idea/
+.vscode/
+*.swp
 ```
 
 ## ディレクトリ構造
@@ -312,14 +258,13 @@ backup-wsl/
 └── tests/                  # テストファイル
     └── backup-wsl.Tests.ps1
 
-バックアップ先/
+バックアップ先（DestRoot）/
 ├── mirror/                 # ミラーコピー
 │   └── projects/           # ソースディレクトリのコピー
-├── archive/                # アーカイブ
-│   ├── projects_full_*.tar.gz      # フルバックアップ
-│   ├── projects_incr_*.tar.gz      # 増分バックアップ
-│   ├── checksums.json              # チェックサム
-│   └── backup-history.json         # バックアップ履歴
+└── archive/                # アーカイブ
+    ├── projects_20260215_020000.tar.gz   # アーカイブ
+    ├── checksums.json                    # チェックサム
+    └── backup-history.json               # バックアップ履歴
 ```
 
 ## 終了コード
@@ -328,7 +273,7 @@ backup-wsl/
 |-------|------|------|
 | 0 | Success | 正常終了 |
 | 1 | LockError | ロック取得失敗（二重実行） |
-| 2 | WslError | WSLエラー |
+| 2 | WslError | WSL エラー |
 | 3 | DiskSpaceError | ディスク容量不足 |
 | 4 | SourceNotFound | ソースが見つからない |
 | 5 | PermissionError | 権限エラー |
@@ -340,9 +285,62 @@ backup-wsl/
 | 12 | RestoreError | リストアエラー |
 | 13 | ScheduleError | スケジュールエラー |
 
+## タスクスケジューラーへの登録
+
+バックアップを毎日自動実行するには、Windows タスクスケジューラーに登録します。
+
+### 登録
+
+管理者権限の PowerShell で実行してください。
+
+```powershell
+# 毎日 02:00 に実行（デフォルト）
+.\backup-wsl.ps1 -RegisterScheduledTask
+
+# 実行時刻を指定（例: 毎日 05:30）
+.\backup-wsl.ps1 -RegisterScheduledTask -ScheduleTime "05:30"
+```
+
+登録されるタスクの設定:
+
+| 項目 | 値 |
+|------|-----|
+| タスク名 | `WSL-Backup` |
+| トリガー | 毎日（指定時刻） |
+| 実行アカウント | `SYSTEM` |
+| 実行レベル | 最上位の特権 |
+| 実行時間制限 | 4 時間 |
+| バッテリー駆動時 | 実行する |
+| アイドル条件 | なし |
+| スケジュール時刻に PC がオフだった場合 | 次回起動時に実行 |
+
+### 登録状況の確認
+
+```powershell
+# PowerShell で確認
+Get-ScheduledTask -TaskName 'WSL-Backup' | Format-List
+
+# 次回実行時刻の確認
+Get-ScheduledTaskInfo -TaskName 'WSL-Backup' | Select-Object NextRunTime, LastRunTime, LastTaskResult
+```
+
+または、`taskschd.msc`（タスクスケジューラ GUI）を開き、「WSL-Backup」を検索してください。
+
+### 登録解除
+
+```powershell
+.\backup-wsl.ps1 -UnregisterScheduledTask
+```
+
+### 注意事項
+
+- 登録・解除には **管理者権限** が必要です。`AutoElevate = $true`（デフォルト）なら自動で昇格を求められます。
+- 既に同名のタスクが存在する場合は、自動的に上書き更新されます。
+- タスクは `-WindowStyle Hidden` で実行されるため、バックアップ中にウィンドウは表示されません。結果はログファイルと通知で確認できます。
+
 ## テスト
 
-Pesterを使用したユニットテスト:
+Pester を使用したユニットテスト:
 
 ```powershell
 # Pesterのインストール
@@ -370,7 +368,7 @@ Invoke-Pester -Path .\tests\backup-wsl.Tests.ps1 -Output Detailed
    Remove-Item "$env:TEMP\backup-wsl-Ubuntu.lock" -Force
    ```
 
-### WSLが応答しない
+### WSL が応答しない
 
 ```
 ERROR: WSL health check failed
@@ -395,7 +393,7 @@ ERROR: Insufficient disk space
 解決方法:
 1. `RequiredFreeSpaceGB` を調整
 2. 古いアーカイブを手動で削除
-3. `KeepDays` を短く設定
+3. `KeepCount` を小さく設定
 
 ### 設定エラー
 
@@ -405,38 +403,24 @@ Configuration errors:
 ```
 
 解決方法:
-設定ファイルで必須項目（`Sources`、`DestRoot`）が設定されているか確認
-
-### 暗号化アーカイブのリストア
-
-```powershell
-# パスワードを入力してリストア
-.\backup-wsl.ps1 -Restore -RestoreArchive "archive.tar.gz.enc" -RestoreTarget "/restore"
-```
-
-## セキュリティに関する注意
-
-1. **設定ファイルの保護**: `EncryptionPassword` を設定する場合、ファイルのアクセス権限を制限してください
-2. **機密ファイルの除外**: `.mirrorignore` で機密ファイルを除外設定してください
-3. **ログの確認**: ログファイルには機密情報がマスキングされますが、定期的に確認してください
+設定ファイル（`config.psd1`）で必須項目（`WslDistro`、`Sources`、`DestRoot`）が設定されているか確認
 
 ## 更新履歴
 
 ### v2.0.0
 
+- 設定ファイルを `config.psd1` に統一
 - 設定バリデーション機能の追加
 - アトミックなロックファイル操作
 - タイムアウト機能
 - 統一終了コード
-- 増分アーカイブ対応
-- 暗号化オプション
 - リストア機能
-- Webhook/メール通知
+- Webhook 通知
 - タスクスケジューラー連携
 - 変更レポート生成
 - チェックサム保存
 - 帯域制限
-- Pesterテスト追加
+- Pester テスト追加
 
 ### v1.0.0
 

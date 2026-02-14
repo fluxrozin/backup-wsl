@@ -22,23 +22,6 @@ node_modules/
 *.db-wal
 *.db-shm
 
-# 機密ファイル（セキュリティ上の理由で除外）
-*.pem
-*.key
-*.p12
-*.pfx
-*.crt
-*.cer
-.env
-.env.*
-credentials.json
-secrets.yaml
-secrets.yml
-*.secret
-.aws/
-.ssh/
-.gnupg/
-
 # IDE/エディタ
 .idea/
 .vscode/

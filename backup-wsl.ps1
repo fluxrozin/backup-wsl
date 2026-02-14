@@ -1,14 +1,14 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    WSL -> Windows バックアップスクリプト（商用レベル版）
+    WSL -> Windows バックアップスクリプト
 .DESCRIPTION
     WSLのディレクトリをWindowsにミラーリング＆アーカイブ保存
     - 複数ソースディレクトリのサポート
-    - 外部設定ファイル（config.json/psd1/toml/yaml）対応
+    - 外部設定ファイル（config.psd1）対応
     - ドライランモード、二重実行防止、整合性検証など堅牢な設計
-    - 増分アーカイブ、暗号化、リストア機能対応
-    - Webhook/メール通知、タスクスケジューラー連携
+    - リストア機能対応
+    - Webhook通知、タスクスケジューラー連携
 .PARAMETER SkipArchive
     アーカイブ作成をスキップします。ミラーバックアップのみを実行します。
 .PARAMETER DryRun
@@ -33,8 +33,6 @@
     除外パターンのテストモードを有効にします。
 .PARAMETER TimeoutMinutes
     バックアップ処理全体のタイムアウト時間（分）を指定します。
-.PARAMETER Incremental
-    増分アーカイブを作成します（前回のフルバックアップ以降の変更のみ）。
 .NOTES
     Windows側から実行
     Version: 2.0.0
@@ -71,16 +69,13 @@ param(
     [switch]$UnregisterScheduledTask,
 
     [Parameter(ParameterSetName = 'Schedule')]
-    [string]$ScheduleTime = "02:00",
+    [string]$ScheduleTime = '02:00',
 
     [Parameter(ParameterSetName = 'TestExclusions')]
     [switch]$TestExclusions,
 
     [Parameter(ParameterSetName = 'Backup')]
-    [int]$TimeoutMinutes = 120,
-
-    [Parameter(ParameterSetName = 'Backup')]
-    [switch]$Incremental
+    [int]$TimeoutMinutes = 120
 )
 
 # ============================================================================
@@ -88,19 +83,19 @@ param(
 # ============================================================================
 
 $Script:ExitCodes = @{
-    Success           = 0
-    LockError         = 1
-    WslError          = 2
-    DiskSpaceError    = 3
-    SourceNotFound    = 4
-    PermissionError   = 5
-    ConfigError       = 6
-    ValidationError   = 7
-    TimeoutError      = 8
-    MirrorError       = 10
-    ArchiveError      = 11
-    RestoreError      = 12
-    ScheduleError     = 13
+    Success         = 0
+    LockError       = 1
+    WslError        = 2
+    DiskSpaceError  = 3
+    SourceNotFound  = 4
+    PermissionError = 5
+    ConfigError     = 6
+    ValidationError = 7
+    TimeoutError    = 8
+    MirrorError     = 10
+    ArchiveError    = 11
+    RestoreError    = 12
+    ScheduleError   = 13
 }
 
 # ============================================================================
@@ -109,12 +104,12 @@ $Script:ExitCodes = @{
 
 $Script:Constants = @{
     RobocopySuccessMaxExitCode = 7
-    DefaultKeepDays            = 15
-    DefaultLogKeepDays         = 30
+    DefaultKeepCount           = 15
+    DefaultLogKeepCount        = 30
     LogDateFormat              = 'yyyy-MM-dd HH:mm:ss'
     TimestampFormat            = 'yyyyMMdd_HHmmss'
     LockFileName               = 'backup-wsl.lock'
-    ConfigFileName             = 'config.json'
+    ConfigFileName             = 'config.psd1'
     MinRequiredFreeSpaceGB     = 1
     HistoryFileName            = 'backup-history.json'
     ChecksumFileName           = 'checksums.json'
@@ -126,120 +121,79 @@ $Script:Constants = @{
 # ============================================================================
 
 $Script:ConfigSchema = @{
-    WslDistro = @{
+    WslDistro            = @{
         Type     = 'string'
         Required = $true
         Pattern  = '^[a-zA-Z0-9_-]+$'
         Message  = 'WslDistro must contain only alphanumeric characters, underscores, and hyphens'
     }
-    Sources = @{
+    Sources              = @{
         Type     = 'array'
         Required = $true
         MinItems = 1
         Message  = 'Sources must be a non-empty array of paths'
     }
-    DestRoot = @{
+    DestRoot             = @{
         Type     = 'string'
         Required = $true
         Message  = 'DestRoot must be a valid Windows path'
     }
-    KeepDays = @{
+    KeepCount            = @{
         Type    = 'int'
         Min     = 0
-        Max     = 3650
+        Max     = 9999
         Default = 15
-        Message = 'KeepDays must be between 0 and 3650'
+        Message = 'KeepCount must be between 0 and 9999'
     }
-    LogKeepDays = @{
+    LogKeepCount         = @{
         Type    = 'int'
         Min     = 0
-        Max     = 3650
+        Max     = 9999
         Default = 30
-        Message = 'LogKeepDays must be between 0 and 3650'
+        Message = 'LogKeepCount must be between 0 and 9999'
     }
-    AutoElevate = @{
+    AutoElevate          = @{
         Type    = 'bool'
         Default = $true
     }
-    ThreadCount = @{
+    ThreadCount          = @{
         Type    = 'int'
         Min     = 0
         Max     = 128
         Default = 0
         Message = 'ThreadCount must be between 0 and 128'
     }
-    ShowNotification = @{
-        Type    = 'bool'
-        Default = $true
-    }
-    VerifyArchive = @{
-        Type    = 'bool'
-        Default = $true
-    }
-    RequiredFreeSpaceGB = @{
-        Type    = 'int'
-        Min     = 0
-        Max     = 10000
-        Default = 10
-        Message = 'RequiredFreeSpaceGB must be between 0 and 10000'
-    }
-    CompressionLevel = @{
-        Type    = 'int'
-        Min     = 1
-        Max     = 9
-        Default = 6
-        Message = 'CompressionLevel must be between 1 (fastest) and 9 (smallest)'
-    }
-    EnableEncryption = @{
-        Type    = 'bool'
-        Default = $false
-    }
-    EncryptionPassword = @{
-        Type      = 'string'
-        Sensitive = $true
-        Default   = ''
-    }
-    NotificationWebhook = @{
-        Type    = 'string'
-        Default = ''
-    }
-    NotificationEmail = @{
-        Type    = 'string'
-        Default = ''
-    }
-    SmtpServer = @{
-        Type    = 'string'
-        Default = ''
-    }
-    SmtpPort = @{
-        Type    = 'int'
-        Min     = 1
-        Max     = 65535
-        Default = 587
-    }
-    SmtpFrom = @{
-        Type    = 'string'
-        Default = ''
-    }
-    IncrementalBaseDays = @{
-        Type    = 'int'
-        Min     = 1
-        Max     = 365
-        Default = 7
-        Message = 'IncrementalBaseDays must be between 1 and 365'
-    }
-    BandwidthLimitMbps = @{
+    BandwidthLimitMbps   = @{
         Type    = 'int'
         Min     = 0
         Max     = 10000
         Default = 0
         Message = 'BandwidthLimitMbps must be between 0 (unlimited) and 10000'
     }
-    GenerateChangeReport = @{
+    RequiredFreeSpaceGB  = @{
+        Type    = 'int'
+        Min     = 0
+        Max     = 10000
+        Default = 10
+        Message = 'RequiredFreeSpaceGB must be between 0 and 10000'
+    }
+    VerifyArchive        = @{
         Type    = 'bool'
         Default = $true
     }
-    SaveChecksums = @{
+    SaveChecksums        = @{
+        Type    = 'bool'
+        Default = $true
+    }
+    ShowNotification     = @{
+        Type    = 'bool'
+        Default = $true
+    }
+    NotificationWebhook  = @{
+        Type    = 'string'
+        Default = ''
+    }
+    GenerateChangeReport = @{
         Type    = 'bool'
         Default = $true
     }
@@ -342,8 +296,7 @@ function Test-BackupConfig {
         $result = Test-ConfigValue -Key $key -Value $value -Schema $Script:ConfigSchema
         if (-not $result.Valid) {
             $errors += $result.Message
-        }
-        else {
+        } else {
             $validated[$key] = $result.Value
         }
     }
@@ -351,18 +304,8 @@ function Test-BackupConfig {
     # 追加のバリデーション: DestRootのパス形式
     if ($validated.DestRoot) {
         if ($validated.DestRoot -notmatch '^[A-Za-z]:\\') {
-            $errors += "DestRoot must be an absolute Windows path (e.g., C:\Backup)"
+            $errors += 'DestRoot must be an absolute Windows path (e.g., C:\Backup)'
         }
-    }
-
-    # 暗号化設定の整合性
-    if ($validated.EnableEncryption -and -not $validated.EncryptionPassword) {
-        $errors += "EncryptionPassword is required when EnableEncryption is true"
-    }
-
-    # メール通知設定の整合性
-    if ($validated.NotificationEmail -and -not $validated.SmtpServer) {
-        $errors += "SmtpServer is required when NotificationEmail is set"
     }
 
     return @{
@@ -383,90 +326,34 @@ function Import-BackupConfig {
         WslDistro            = 'Ubuntu'
         Sources              = @()
         DestRoot             = ''
-        KeepDays             = $Script:Constants.DefaultKeepDays
-        LogKeepDays          = $Script:Constants.DefaultLogKeepDays
+        KeepCount            = $Script:Constants.DefaultKeepCount
+        LogKeepCount         = $Script:Constants.DefaultLogKeepCount
         AutoElevate          = $true
         ThreadCount          = 0
-        ShowNotification     = $true
-        VerifyArchive        = $true
-        RequiredFreeSpaceGB  = 10
-        CompressionLevel     = 6
-        EnableEncryption     = $false
-        EncryptionPassword   = ''
-        NotificationWebhook  = ''
-        NotificationEmail    = ''
-        SmtpServer           = ''
-        SmtpPort             = 587
-        SmtpFrom             = ''
-        IncrementalBaseDays  = 7
         BandwidthLimitMbps   = 0
-        GenerateChangeReport = $true
+        RequiredFreeSpaceGB  = 10
+        VerifyArchive        = $true
         SaveChecksums        = $true
+        ShowNotification     = $true
+        NotificationWebhook  = ''
+        GenerateChangeReport = $true
     }
 
     if (Test-Path $ConfigPath) {
         try {
-            $extension = [System.IO.Path]::GetExtension($ConfigPath).ToLower()
-            $userConfig = $null
+            $userConfig = Import-PowerShellDataFile -Path $ConfigPath
 
-            switch ($extension) {
-                '.json' {
-                    $jsonContent = Get-Content $ConfigPath -Raw -Encoding UTF8
-                    $userConfig = $jsonContent | ConvertFrom-Json
-                }
-                '.psd1' {
-                    $userConfig = Import-PowerShellDataFile -Path $ConfigPath
-                }
-                '.toml' {
-                    if (-not (Get-Module -ListAvailable -Name PSToml)) {
-                        Write-Host "警告: TOML形式の設定ファイルを読み込むには PSToml モジュールが必要です。" -ForegroundColor Yellow
-                        Write-Host "  インストール方法: Install-Module -Name PSToml -Scope CurrentUser" -ForegroundColor Yellow
-                        return @{ Config = $defaultConfig; Valid = $false; Errors = @("PSToml module not installed") }
-                    }
-                    Import-Module PSToml -ErrorAction Stop
-                    $tomlContent = Get-Content $ConfigPath -Raw -Encoding UTF8
-                    $userConfig = ConvertFrom-Toml -TomlString $tomlContent
-
-                    if ($userConfig.Sources -and $userConfig.Sources -is [System.Collections.ArrayList]) {
-                        $userConfig.Sources = $userConfig.Sources.ToArray()
-                    }
-                }
-                { $_ -in '.yaml', '.yml' } {
-                    if (-not (Get-Module -ListAvailable -Name powershell-yaml)) {
-                        Write-Host "警告: YAML形式の設定ファイルを読み込むには powershell-yaml モジュールが必要です。" -ForegroundColor Yellow
-                        Write-Host "  インストール方法: Install-Module -Name powershell-yaml -Scope CurrentUser" -ForegroundColor Yellow
-                        return @{ Config = $defaultConfig; Valid = $false; Errors = @("powershell-yaml module not installed") }
-                    }
-                    Import-Module powershell-yaml -ErrorAction Stop
-                    $yamlContent = Get-Content $ConfigPath -Raw -Encoding UTF8
-                    $userConfig = ConvertFrom-Yaml -Yaml $yamlContent
-                }
-                default {
-                    Write-Host "警告: サポートされていない設定ファイル形式です: $extension" -ForegroundColor Yellow
-                    return @{ Config = $defaultConfig; Valid = $false; Errors = @("Unsupported config format: $extension") }
-                }
-            }
-
-            # 設定をマージ（PSObjectとHashtable両方に対応）
-            if ($userConfig -is [hashtable]) {
-                foreach ($key in $userConfig.Keys) {
-                    $defaultConfig[$key] = $userConfig[$key]
-                }
-            }
-            elseif ($userConfig.PSObject.Properties) {
-                foreach ($prop in $userConfig.PSObject.Properties) {
-                    $defaultConfig[$prop.Name] = $prop.Value
-                }
+            # 設定をマージ
+            foreach ($key in $userConfig.Keys) {
+                $defaultConfig[$key] = $userConfig[$key]
             }
 
             Write-Host "設定ファイルを読み込みました: $ConfigPath" -ForegroundColor Gray
-        }
-        catch {
+        } catch {
             Write-Host "警告: 設定ファイルの読み込みに失敗しました: $_" -ForegroundColor Yellow
             return @{ Config = $defaultConfig; Valid = $false; Errors = @("Failed to load config: $_") }
         }
-    }
-    else {
+    } else {
         Write-Host "設定ファイルが見つかりません: $ConfigPath" -ForegroundColor Yellow
         return @{ Config = $defaultConfig; Valid = $false; Errors = @("Config file not found: $ConfigPath") }
     }
@@ -501,8 +388,8 @@ function Request-Administrator {
         return $false
     }
 
-    Write-Host "管理者権限が必要です。管理者権限で再実行します..." -ForegroundColor Yellow
-    Write-Host "UACダイアログが表示されたら「はい」をクリックしてください。" -ForegroundColor Yellow
+    Write-Host '管理者権限が必要です。管理者権限で再実行します...' -ForegroundColor Yellow
+    Write-Host 'UACダイアログが表示されたら「はい」をクリックしてください。' -ForegroundColor Yellow
 
     $argString = "-ExecutionPolicy Bypass -File `"$ScriptPath`""
     foreach ($arg in $Arguments) {
@@ -512,8 +399,7 @@ function Request-Administrator {
     try {
         Start-Process powershell -Verb RunAs -ArgumentList $argString -Wait
         exit $Script:ExitCodes.Success
-    }
-    catch {
+    } catch {
         Write-Host "管理者権限の取得に失敗しました: $_" -ForegroundColor Red
         return $true
     }
@@ -549,8 +435,7 @@ function Test-BackupLock {
         # 古いロックファイルを削除
         Remove-Item $LockFilePath -Force -ErrorAction SilentlyContinue
         return $false
-    }
-    catch {
+    } catch {
         Remove-Item $LockFilePath -Force -ErrorAction SilentlyContinue
         return $false
     }
@@ -584,16 +469,14 @@ function New-BackupLock {
             $fileStream.Close()
 
             return $true
-        }
-        catch [System.IO.IOException] {
+        } catch [System.IO.IOException] {
             # ファイルが既に存在する場合
             if (Test-BackupLock -LockFilePath $LockFilePath) {
                 return $false
             }
             # 古いロックが残っている場合は再試行
             Start-Sleep -Milliseconds 100
-        }
-        catch {
+        } catch {
             Write-Log "Failed to create lock file: $_" 'ERROR'
             return $false
         }
@@ -617,8 +500,7 @@ function Initialize-Timeout {
     if ($Minutes -gt 0) {
         $script:DeadlineTime = (Get-Date).AddMinutes($Minutes)
         Write-Log "Timeout set to $Minutes minutes (deadline: $($script:DeadlineTime.ToString($Script:Constants.LogDateFormat)))" 'INFO'
-    }
-    else {
+    } else {
         $script:DeadlineTime = $null
     }
 }
@@ -629,7 +511,7 @@ function Test-Timeout {
     }
 
     if ((Get-Date) -gt $script:DeadlineTime) {
-        Write-Log "Backup operation timed out" 'ERROR'
+        Write-Log 'Backup operation timed out' 'ERROR'
         return $true
     }
 
@@ -644,14 +526,13 @@ function Test-WslHealth {
     param([string]$Distro)
 
     try {
-        $result = wsl -d $Distro -e echo "OK" 2>&1
-        if ($result -eq "OK") {
+        $result = wsl -d $Distro -e echo 'OK' 2>&1
+        if ($result -eq 'OK') {
             return $true
         }
         Write-Log "WSL health check failed: $result" 'ERROR'
         return $false
-    }
-    catch {
+    } catch {
         Write-Log "WSL is not responding: $_" 'ERROR'
         return $false
     }
@@ -693,8 +574,7 @@ function Test-DiskSpace {
 
         Write-Log "Could not check disk space for path: $Path" 'WARN'
         return $true
-    }
-    catch {
+    } catch {
         Write-Log "Disk space check failed: $_" 'WARN'
         return $true
     }
@@ -714,8 +594,7 @@ function Test-SafePath {
         $resolved = [System.IO.Path]::GetFullPath($Path)
         $resolvedRoot = [System.IO.Path]::GetFullPath($AllowedRoot)
         return $resolved.StartsWith($resolvedRoot, [StringComparison]::OrdinalIgnoreCase)
-    }
-    catch {
+    } catch {
         return $false
     }
 }
@@ -760,8 +639,7 @@ function Test-ArchiveIntegrity {
         $archivePathWsl = ConvertTo-WslPath -WindowsPath $ArchivePath
         $null = wsl -d $WslDistro -e gzip -t $archivePathWsl 2>&1
         return $LASTEXITCODE -eq 0
-    }
-    catch {
+    } catch {
         Write-Log "Archive integrity check failed: $_" 'WARN'
         return $false
     }
@@ -813,15 +691,13 @@ function Write-MirrorStats {
 
     if ($Stats.FilesTotal -gt 0) {
         Write-Log "${Prefix}Files: Total=$($Stats.FilesTotal), Copied=$($Stats.FilesCopied), Skipped=$($Stats.FilesSkipped)" 'INFO'
-    }
-    else {
+    } else {
         Write-Log "${Prefix}Files: Copied=$($Stats.FilesCopied), Skipped=$($Stats.FilesSkipped)" 'INFO'
     }
 
     if ($Stats.DirsTotal -gt 0) {
         Write-Log "${Prefix}Directories: Total=$($Stats.DirsTotal), Copied=$($Stats.DirsCopied), Skipped=$($Stats.DirsSkipped)" 'INFO'
-    }
-    else {
+    } else {
         Write-Log "${Prefix}Directories: Copied=$($Stats.DirsCopied), Skipped=$($Stats.DirsSkipped)" 'INFO'
     }
 
@@ -862,8 +738,7 @@ function Read-MirrorIgnore {
         if ($line -and -not $line.StartsWith('#')) {
             if ($line.EndsWith('/')) {
                 $result.Dirs += $line.TrimEnd('/')
-            }
-            else {
+            } else {
                 $result.Files += $line
             }
         }
@@ -882,8 +757,7 @@ function Invoke-WithRetry {
     for ($i = 1; $i -le $MaxRetries; $i++) {
         try {
             return & $ScriptBlock
-        }
-        catch {
+        } catch {
             if ($i -eq $MaxRetries) {
                 Write-Log "$OperationName failed after $MaxRetries retries: $_" 'ERROR'
                 throw
@@ -909,14 +783,13 @@ function Show-Progress {
 
     if ($PercentComplete -ge 0) {
         Write-Progress -Activity $Activity -Status $Status -PercentComplete $PercentComplete
-    }
-    else {
+    } else {
         Write-Progress -Activity $Activity -Status $Status
     }
 }
 
 function Complete-Progress {
-    Write-Progress -Activity "Backup" -Completed
+    Write-Progress -Activity 'Backup' -Completed
 }
 
 # ============================================================================
@@ -938,10 +811,8 @@ function Send-BackupNotification {
     try {
         if (Get-Module -ListAvailable -Name BurntToast) {
             Import-Module BurntToast -ErrorAction SilentlyContinue
-            $icon = if ($Success) { 'Completed' } else { 'Error' }
             New-BurntToastNotification -Text $Title, $Message -AppLogo $null
-        }
-        else {
+        } else {
             Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
             $balloon = New-Object System.Windows.Forms.NotifyIcon
             $balloon.Icon = [System.Drawing.SystemIcons]::Information
@@ -953,19 +824,13 @@ function Send-BackupNotification {
             Start-Sleep -Milliseconds 100
             $balloon.Dispose()
         }
-    }
-    catch {
+    } catch {
         Write-Log "Failed to send Windows notification: $_" 'WARN'
     }
 
     # Webhook通知
     if ($script:Config.NotificationWebhook) {
         Send-WebhookNotification -Title $Title -Message $Message -Success $Success
-    }
-
-    # メール通知
-    if ($script:Config.NotificationEmail -and $script:Config.SmtpServer) {
-        Send-EmailNotification -Title $Title -Message $Message -Success $Success
     }
 }
 
@@ -981,8 +846,8 @@ function Send-WebhookNotification {
     }
 
     try {
-        $emoji = if ($Success) { ":white_check_mark:" } else { ":x:" }
-        $color = if ($Success) { "good" } else { "danger" }
+        $emoji = if ($Success) { ':white_check_mark:' } else { ':x:' }
+        $color = if ($Success) { 'good' } else { 'danger' }
 
         # Slack形式
         $payload = @{
@@ -998,55 +863,9 @@ function Send-WebhookNotification {
         } | ConvertTo-Json -Depth 5
 
         $null = Invoke-RestMethod -Uri $script:Config.NotificationWebhook -Method Post -Body $payload -ContentType 'application/json' -ErrorAction Stop
-        Write-Log "Webhook notification sent" 'INFO'
-    }
-    catch {
+        Write-Log 'Webhook notification sent' 'INFO'
+    } catch {
         Write-Log "Failed to send webhook notification: $_" 'WARN'
-    }
-}
-
-function Send-EmailNotification {
-    param(
-        [string]$Title,
-        [string]$Message,
-        [bool]$Success
-    )
-
-    if (-not $script:Config.NotificationEmail -or -not $script:Config.SmtpServer) {
-        return
-    }
-
-    try {
-        $status = if ($Success) { "SUCCESS" } else { "FAILED" }
-        $subject = "[$status] $Title"
-
-        $body = @"
-WSL Backup Report
-==================
-
-Status: $status
-Time: $(Get-Date -Format $Script:Constants.LogDateFormat)
-
-$Message
-
----
-WSL Backup Script v$($Script:Constants.Version)
-"@
-
-        $mailParams = @{
-            From       = $script:Config.SmtpFrom
-            To         = $script:Config.NotificationEmail
-            Subject    = $subject
-            Body       = $body
-            SmtpServer = $script:Config.SmtpServer
-            Port       = $script:Config.SmtpPort
-        }
-
-        Send-MailMessage @mailParams -ErrorAction Stop
-        Write-Log "Email notification sent to $($script:Config.NotificationEmail)" 'INFO'
-    }
-    catch {
-        Write-Log "Failed to send email notification: $_" 'WARN'
     }
 }
 
@@ -1077,8 +896,7 @@ function Remove-ExcludedDirectories {
         if (Test-Path $excludePath) {
             try {
                 Remove-Item -Path $excludePath -Recurse -Force -ErrorAction Stop
-            }
-            catch {
+            } catch {
                 $failedDeletions += @{
                     Path  = $excludePath
                     Error = $_.Exception.Message
@@ -1110,11 +928,11 @@ function ConvertFrom-RobocopyLog {
     param([string]$LogPath)
 
     $stats = @{
-        FilesCopied  = 0; FilesSkipped = 0; FilesTotal = 0; FilesFailed = 0
-        DirsCopied   = 0; DirsSkipped = 0; DirsTotal = 0; DirsFailed = 0
-        BytesCopied  = 0
-        Errors       = @()
-        NewFiles     = @()
+        FilesCopied = 0; FilesSkipped = 0; FilesTotal = 0; FilesFailed = 0
+        DirsCopied = 0; DirsSkipped = 0; DirsTotal = 0; DirsFailed = 0
+        BytesCopied = 0
+        Errors = @()
+        NewFiles = @()
         ModifiedFiles = @()
         DeletedFiles = @()
     }
@@ -1128,39 +946,38 @@ function ConvertFrom-RobocopyLog {
         $logText = $shiftJis.GetString($logBytes)
         [System.IO.File]::WriteAllText($LogPath, $logText, $utf8)
 
-        $inFileSection = $false
         foreach ($line in ($logText -split "`r?`n")) {
-            # ファイル統計
-            if ($line -match '^\s*Files\s*:\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)') {
-                $stats.FilesTotal = [int]$matches[1]
-                $stats.FilesCopied = [int]$matches[2]
-                $stats.FilesSkipped = [int]$matches[3]
-                # matches[4] = Mismatch, matches[5] = Failed
-                $stats.FilesFailed = [int]$matches[5]
+            # ファイル統計（英語: "Files :" / 日本語: "ファイル:"）
+            if ($line -match '^\s*(Files|ファイル)\s*:\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)') {
+                $stats.FilesTotal = [int]$matches[2]
+                $stats.FilesCopied = [int]$matches[3]
+                $stats.FilesSkipped = [int]$matches[4]
+                # matches[5] = Mismatch, matches[6] = Failed
+                $stats.FilesFailed = [int]$matches[6]
             }
-            elseif ($line -match 'Files\s*:\s*(\d+)\s+(\d+)\s+(\d+)') {
-                $stats.FilesTotal = [int]$matches[1]
-                $stats.FilesCopied = [int]$matches[2]
-                $stats.FilesSkipped = [int]$matches[3]
-            }
-
-            # ディレクトリ統計
-            if ($line -match '^\s*Dirs\s*:\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)') {
-                $stats.DirsTotal = [int]$matches[1]
-                $stats.DirsCopied = [int]$matches[2]
-                $stats.DirsSkipped = [int]$matches[3]
-                $stats.DirsFailed = [int]$matches[5]
-            }
-            elseif ($line -match 'Dirs\s*:\s*(\d+)\s+(\d+)\s+(\d+)') {
-                $stats.DirsTotal = [int]$matches[1]
-                $stats.DirsCopied = [int]$matches[2]
-                $stats.DirsSkipped = [int]$matches[3]
+            elseif ($line -match '(Files|ファイル)\s*:\s*(\d+)\s+(\d+)\s+(\d+)') {
+                $stats.FilesTotal = [int]$matches[2]
+                $stats.FilesCopied = [int]$matches[3]
+                $stats.FilesSkipped = [int]$matches[4]
             }
 
-            # バイト数
-            if ($line -match 'Bytes\s*:\s*([\d.]+)\s*([kmgt]?)') {
-                $value = [double]$matches[1]
-                $unit = $matches[2].ToLower()
+            # ディレクトリ統計（英語: "Dirs :" / 日本語: "ディレクトリ:"）
+            if ($line -match '^\s*(Dirs|ディレクトリ)\s*:\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)') {
+                $stats.DirsTotal = [int]$matches[2]
+                $stats.DirsCopied = [int]$matches[3]
+                $stats.DirsSkipped = [int]$matches[4]
+                $stats.DirsFailed = [int]$matches[6]
+            }
+            elseif ($line -match '(Dirs|ディレクトリ)\s*:\s*(\d+)\s+(\d+)\s+(\d+)') {
+                $stats.DirsTotal = [int]$matches[2]
+                $stats.DirsCopied = [int]$matches[3]
+                $stats.DirsSkipped = [int]$matches[4]
+            }
+
+            # バイト数（英語: "Bytes :" / 日本語: "バイト:"）
+            if ($line -match '(Bytes|バイト)\s*:\s*([\d.]+)\s*([kmgt]?)') {
+                $value = [double]$matches[2]
+                $unit = $matches[3].ToLower()
                 switch ($unit) {
                     'k' { $stats.BytesCopied = [long]($value * 1KB) }
                     'm' { $stats.BytesCopied = [long]($value * 1MB) }
@@ -1170,17 +987,17 @@ function ConvertFrom-RobocopyLog {
                 }
             }
 
-            # 変更レポート用: 新規ファイル
-            if ($line -match '^\s*New File\s+(.+)$') {
-                $stats.NewFiles += $matches[1].Trim()
+            # 変更レポート用: 新規ファイル（英語: "New File" / 日本語: "新しいファイル"）
+            if ($line -match '^\s*(New File|新しいファイル)\s+(.+)$') {
+                $stats.NewFiles += $matches[2].Trim()
             }
-            # 変更レポート用: 更新ファイル
-            if ($line -match '^\s*Newer\s+(.+)$' -or $line -match '^\s*Changed\s+(.+)$') {
-                $stats.ModifiedFiles += $matches[1].Trim()
+            # 変更レポート用: 更新ファイル（英語: "Newer"/"Changed" / 日本語: "新しい"/"マイナー変更した"）
+            if ($line -match '^\s*(Newer|Changed|新しい|マイナー変更した)\s+(.+)$') {
+                $stats.ModifiedFiles += $matches[2].Trim()
             }
-            # 変更レポート用: 削除ファイル
-            if ($line -match '^\s*\*EXTRA File\s+(.+)$') {
-                $stats.DeletedFiles += $matches[1].Trim()
+            # 変更レポート用: 削除ファイル（英語: "*EXTRA File" / 日本語: "*EXTRA ファイル"）
+            if ($line -match '^\s*\*EXTRA\s+(File|ファイル)\s+(.+)$') {
+                $stats.DeletedFiles += $matches[2].Trim()
             }
 
             # エラー
@@ -1188,8 +1005,7 @@ function ConvertFrom-RobocopyLog {
                 $stats.Errors += $line
             }
         }
-    }
-    catch {
+    } catch {
         Write-Log "Failed to parse robocopy log: $_" 'WARN'
     }
 
@@ -1273,8 +1089,7 @@ function Get-FileChecksum {
     try {
         $hash = Get-FileHash -Path $FilePath -Algorithm SHA256 -ErrorAction Stop
         return $hash.Hash
-    }
-    catch {
+    } catch {
         return $null
     }
 }
@@ -1302,16 +1117,15 @@ function Save-ArchiveChecksum {
 
         if ($checksum) {
             $checksums[$archiveName] = @{
-                SHA256    = $checksum
-                Size      = (Get-Item $ArchivePath).Length
-                Created   = (Get-Date).ToString('o')
+                SHA256  = $checksum
+                Size    = (Get-Item $ArchivePath).Length
+                Created = (Get-Date).ToString('o')
             }
 
             $checksums | ConvertTo-Json -Depth 3 | Set-Content $checksumFile -Encoding UTF8
             Write-Log "Checksum saved for $archiveName" 'INFO'
         }
-    }
-    catch {
+    } catch {
         Write-Log "Failed to save checksum: $_" 'WARN'
     }
 }
@@ -1338,8 +1152,7 @@ function Test-ArchiveChecksum {
 
             return $expectedHash -eq $actualHash
         }
-    }
-    catch {
+    } catch {
         Write-Log "Failed to verify checksum: $_" 'WARN'
     }
 
@@ -1359,8 +1172,7 @@ function Get-BackupHistory {
 
     try {
         return Get-Content $HistoryPath -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable
-    }
-    catch {
+    } catch {
         return @{ Backups = @() }
     }
 }
@@ -1382,35 +1194,30 @@ function Save-BackupHistory {
         }
 
         $history | ConvertTo-Json -Depth 5 | Set-Content $HistoryPath -Encoding UTF8
-    }
-    catch {
+    } catch {
         Write-Log "Failed to save backup history: $_" 'WARN'
     }
-}
-
-function Get-LastFullBackupDate {
-    param(
-        [string]$HistoryPath,
-        [string]$SourceName
-    )
-
-    $history = Get-BackupHistory -HistoryPath $HistoryPath
-
-    $lastFull = $history.Backups |
-        Where-Object { $_.SourceName -eq $SourceName -and $_.Type -eq 'Full' -and $_.Success } |
-        Sort-Object { [datetime]$_.Timestamp } |
-        Select-Object -Last 1
-
-    if ($lastFull) {
-        return [datetime]$lastFull.Timestamp
-    }
-
-    return $null
 }
 
 # ============================================================================
 # ミラーリング処理
 # ============================================================================
+
+function Get-RobocopyExitMessage {
+    param([int]$ExitCode)
+
+    if ($ExitCode -eq 0) { return 'No changes - source and destination are synchronized' }
+    if ($ExitCode -ge 16) { return "FATAL ERROR (code $ExitCode) - serious error, no files copied" }
+    if ($ExitCode -ge 8) { return "FAILED (code $ExitCode) - some files could not be copied (retries exceeded)" }
+
+    $parts = @()
+    if ($ExitCode -band 1) { $parts += 'new files copied' }
+    if ($ExitCode -band 2) { $parts += 'extra files/dirs detected in destination' }
+    if ($ExitCode -band 4) { $parts += 'mismatched files detected' }
+    $detail = $parts -join ', '
+
+    return "OK (code $ExitCode) - $detail"
+}
 
 function Invoke-Mirroring {
     param(
@@ -1429,27 +1236,22 @@ function Invoke-Mirroring {
 
     $failedDeletions = Remove-ExcludedDirectories -MirrorDest $MirrorDest -ExcludeDirs $Excludes.Dirs -Timestamp $Timestamp
 
-    if ($script:DryRunMode) {
-        Write-Log "[DryRun] Would run robocopy from $WslSource to $MirrorDest" 'INFO'
-        return @{
-            Duration        = 0
-            Stats           = @{ FilesCopied = 0; FilesSkipped = 0; DirsCopied = 0; DirsSkipped = 0; BytesCopied = 0; Errors = @(); NewFiles = @(); ModifiedFiles = @(); DeletedFiles = @() }
-            ExitCode        = 0
-            FailedDeletions = @()
-        }
-    }
-
     $robocopyLog = Join-Path $script:LogDir "robocopy_$Timestamp.log"
 
     $actualThreadCount = if ($ThreadCount -gt 0) {
         $ThreadCount
-    }
-    else {
+    } else {
         [Math]::Min([Environment]::ProcessorCount, 16)
     }
 
     # /V オプションで詳細出力（変更レポート用）
     $robocopyArgs = @($WslSource, $MirrorDest, '/MIR', '/R:1', '/W:0', "/MT:$actualThreadCount", '/NP', '/V', "/LOG:$robocopyLog")
+
+    # DryRunモードでは /L（リストのみ）を追加して予定を表示
+    if ($script:DryRunMode) {
+        $robocopyArgs += '/L'
+        Write-Log "[DryRun] Running robocopy in list-only mode (/L)" 'INFO'
+    }
 
     # 帯域制限
     if ($BandwidthLimit -gt 0) {
@@ -1473,14 +1275,14 @@ function Invoke-Mirroring {
 
     Write-Log "Thread count: $actualThreadCount" 'INFO'
 
-    Show-Progress -Activity "Mirroring" -Status "Running robocopy..." -PercentComplete 10
+    Show-Progress -Activity 'Mirroring' -Status 'Running robocopy...' -PercentComplete 10
 
     $errorLog = Join-Path $env:TEMP "robocopy_error_$PID.log"
     $outputLog = Join-Path $env:TEMP "robocopy_output_$PID.log"
 
     $process = Start-Process -FilePath 'robocopy' -ArgumentList $robocopyArgs -NoNewWindow -PassThru -Wait -RedirectStandardError $errorLog -RedirectStandardOutput $outputLog
 
-    Show-Progress -Activity "Mirroring" -Status "Processing results..." -PercentComplete 90
+    Show-Progress -Activity 'Mirroring' -Status 'Processing results...' -PercentComplete 90
 
     $endTime = Get-Date
     $duration = ($endTime - $startTime).TotalSeconds
@@ -1503,14 +1305,14 @@ function Invoke-Mirroring {
 
     Write-Log "Mirroring completed in $([math]::Round($duration, 2)) seconds" 'INFO'
     Write-MirrorStats -Stats $stats -Prefix '  '
-    Write-Log "  Exit Code: $($process.ExitCode)" 'INFO'
+    $exitMsg = Get-RobocopyExitMessage -ExitCode $process.ExitCode
+    Write-Log "  Result: $exitMsg" 'INFO'
 
     if ($process.ExitCode -le $Script:Constants.RobocopySuccessMaxExitCode) {
-        Write-Host "  OK (exit=$($process.ExitCode))" -ForegroundColor Green
-    }
-    else {
-        Write-Host "  WARNING: exit=$($process.ExitCode)" -ForegroundColor Yellow
-        Write-Log "Warning: Robocopy exit code $($process.ExitCode)" 'WARN'
+        Write-Host "  $exitMsg" -ForegroundColor Green
+    } else {
+        Write-Host "  $exitMsg" -ForegroundColor Yellow
+        Write-Log "Warning: $exitMsg" 'WARN'
     }
 
     return @{
@@ -1531,12 +1333,7 @@ function New-Archive {
         [string]$SourceDir,
         [string]$ArchiveDest,
         [string]$Timestamp,
-        [bool]$Verify,
-        [int]$CompressionLevel = 6,
-        [bool]$Encrypt = $false,
-        [string]$Password = '',
-        [bool]$Incremental = $false,
-        [datetime]$SinceDate = [datetime]::MinValue
+        [bool]$Verify
     )
 
     $startTime = Get-Date
@@ -1546,29 +1343,23 @@ function New-Archive {
     $parentDir = $SourceDir -replace '/[^/]+$', ''
     if (-not $parentDir) { $parentDir = '/' }
 
-    $archiveType = if ($Incremental) { 'incr' } else { 'full' }
-    $archiveName = "${targetName}_${archiveType}_$Timestamp.tar.gz"
-
-    if ($Encrypt) {
-        $archiveName += '.enc'
-    }
+    $archiveName = "${targetName}_$Timestamp.tar.gz"
 
     $archivePath = Join-Path $ArchiveDest $archiveName
     $archivePathWsl = ConvertTo-WslPath -WindowsPath $archivePath
 
     if ($script:DryRunMode) {
-        Write-Log "[DryRun] Would create $archiveType archive: $archivePath" 'INFO'
+        Write-Log "[DryRun] Would create archive: $archivePath" 'INFO'
         return @{
             Duration    = 0
             ArchiveName = $archiveName
             ArchivePath = $archivePath
             TarErrors   = @()
             Verified    = $false
-            Type        = $archiveType
         }
     }
 
-    Show-Progress -Activity "Creating Archive" -Status "Compressing $targetName..." -PercentComplete 20
+    Show-Progress -Activity 'Creating Archive' -Status "Compressing $targetName..." -PercentComplete 20
 
     $tarErrorLog = Join-Path $script:LogDir "tar_errors_$Timestamp.log"
     $tarErrorLogWsl = ConvertTo-WslPath -WindowsPath $tarErrorLog
@@ -1576,41 +1367,13 @@ function New-Archive {
     $safeTargetName = $targetName -replace "'", "'\\''"
     $safeParentDir = $parentDir -replace "'", "'\\''"
 
-    # 圧縮レベル設定
-    $gzipOpt = "GZIP=-$CompressionLevel"
+    $tarCmd = "GZIP=-6 tar -czf '$archivePathWsl' --ignore-failed-read -C '$safeParentDir' '$safeTargetName' 2>'$tarErrorLogWsl'"
 
-    # 増分バックアップオプション
-    $newerOpt = ''
-    if ($Incremental -and $SinceDate -ne [datetime]::MinValue) {
-        $sinceDateStr = $SinceDate.ToString('yyyy-MM-dd HH:mm:ss')
-        $newerOpt = "--newer='$sinceDateStr'"
-        Write-Log "Incremental backup since: $sinceDateStr" 'INFO'
+    Invoke-WithRetry -OperationName 'Archive creation' -MaxRetries 2 -DelaySeconds 3 -ScriptBlock {
+        wsl -d $WslDistro -e bash -c $tarCmd
     }
 
-    if ($Encrypt -and $Password) {
-        # 暗号化アーカイブ
-        $tempArchive = $archivePathWsl -replace '\.enc$', ''
-        $tarCmd = "$gzipOpt tar -czf '$tempArchive' --ignore-failed-read $newerOpt -C '$safeParentDir' '$safeTargetName' 2>'$tarErrorLogWsl'"
-
-        Invoke-WithRetry -OperationName 'Archive creation' -MaxRetries 2 -DelaySeconds 3 -ScriptBlock {
-            wsl -d $WslDistro -e bash -c $tarCmd
-        }
-
-        Show-Progress -Activity "Creating Archive" -Status "Encrypting..." -PercentComplete 70
-
-        # OpenSSLで暗号化
-        $encryptCmd = "openssl enc -aes-256-cbc -salt -pbkdf2 -in '$tempArchive' -out '$archivePathWsl' -pass pass:'$Password' && rm '$tempArchive'"
-        wsl -d $WslDistro -e bash -c $encryptCmd
-    }
-    else {
-        $tarCmd = "$gzipOpt tar -czf '$archivePathWsl' --ignore-failed-read $newerOpt -C '$safeParentDir' '$safeTargetName' 2>'$tarErrorLogWsl'"
-
-        Invoke-WithRetry -OperationName 'Archive creation' -MaxRetries 2 -DelaySeconds 3 -ScriptBlock {
-            wsl -d $WslDistro -e bash -c $tarCmd
-        }
-    }
-
-    Show-Progress -Activity "Creating Archive" -Status "Finalizing..." -PercentComplete 90
+    Show-Progress -Activity 'Creating Archive' -Status 'Finalizing...' -PercentComplete 90
 
     $endTime = Get-Date
     $duration = ($endTime - $startTime).TotalSeconds
@@ -1631,32 +1394,28 @@ function New-Archive {
         $size = (Get-Item $archivePath).Length / 1MB
         Write-Host "  OK: $archiveName ($('{0:N1}' -f $size) MB)" -ForegroundColor Green
         Write-Log "Archive created successfully: $archiveName" 'INFO'
-        Write-Log "  Type: $archiveType" 'INFO'
         Write-Log "  Size: $([math]::Round($size, 2)) MB" 'INFO'
         Write-Log "  Duration: $([math]::Round($duration, 2)) seconds" 'INFO'
-        Write-Log "  Compression Level: $CompressionLevel" 'INFO'
 
         # チェックサム保存
         Save-ArchiveChecksum -ArchivePath $archivePath -ArchiveDest $ArchiveDest
 
-        if ($Verify -and -not $Encrypt) {
-            Write-Host "  Verifying archive..." -ForegroundColor Gray
+        if ($Verify) {
+            Write-Host '  Verifying archive...' -ForegroundColor Gray
             $verified = Test-ArchiveIntegrity -ArchivePath $archivePath -WslDistro $WslDistro
             if ($verified) {
-                Write-Host "  Integrity check: OK" -ForegroundColor Green
-                Write-Log "  Integrity check: PASSED" 'INFO'
-            }
-            else {
-                Write-Host "  Integrity check: FAILED" -ForegroundColor Red
-                Write-Log "  Integrity check: FAILED" 'WARN'
+                Write-Host '  Integrity check: OK' -ForegroundColor Green
+                Write-Log '  Integrity check: PASSED' 'INFO'
+            } else {
+                Write-Host '  Integrity check: FAILED' -ForegroundColor Red
+                Write-Log '  Integrity check: FAILED' 'WARN'
             }
         }
 
         if ($tarErrors.Count -gt 0) {
             Write-Log "  Warnings: $($tarErrors.Count) files skipped" 'WARN'
         }
-    }
-    else {
+    } else {
         Write-Host '  ERROR: Archive not created' -ForegroundColor Red
         Write-Log 'ERROR: Archive creation failed' 'ERROR'
     }
@@ -1667,7 +1426,6 @@ function New-Archive {
         ArchivePath = $archivePath
         TarErrors   = $tarErrors
         Verified    = $verified
-        Type        = $archiveType
     }
 }
 
@@ -1679,12 +1437,10 @@ function Invoke-Restore {
     param(
         [string]$ArchivePath,
         [string]$RestoreTarget,
-        [string]$WslDistro,
-        [bool]$Decrypt = $false,
-        [string]$Password = ''
+        [string]$WslDistro
     )
 
-    Write-Host "=== Restore Mode ===" -ForegroundColor Cyan
+    Write-Host '=== Restore Mode ===' -ForegroundColor Cyan
 
     if (-not (Test-Path $ArchivePath)) {
         Write-Host "ERROR: Archive not found: $ArchivePath" -ForegroundColor Red
@@ -1693,13 +1449,13 @@ function Invoke-Restore {
 
     # リストア先の確認
     if (-not $RestoreTarget) {
-        Write-Host "ERROR: RestoreTarget is required" -ForegroundColor Red
+        Write-Host 'ERROR: RestoreTarget is required' -ForegroundColor Red
         return $false
     }
 
     # WSLパスのバリデーション
     if (-not (Test-SourcePath -SourcePath $RestoreTarget -WslDistro $WslDistro)) {
-        Write-Host "ERROR: Invalid restore target path" -ForegroundColor Red
+        Write-Host 'ERROR: Invalid restore target path' -ForegroundColor Red
         return $false
     }
 
@@ -1714,7 +1470,7 @@ function Invoke-Restore {
     # 確認プロンプト
     $confirm = Read-Host "This will restore files to '$RestoreTarget'. Continue? (yes/no)"
     if ($confirm -ne 'yes') {
-        Write-Host "Restore cancelled." -ForegroundColor Yellow
+        Write-Host 'Restore cancelled.' -ForegroundColor Yellow
         return $false
     }
 
@@ -1724,33 +1480,17 @@ function Invoke-Restore {
         # リストア先ディレクトリの作成
         wsl -d $WslDistro -e mkdir -p $RestoreTarget
 
-        if ($Decrypt -or $ArchivePath.EndsWith('.enc')) {
-            if (-not $Password) {
-                $securePassword = Read-Host "Enter decryption password" -AsSecureString
-                $Password = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
-                    [Runtime.InteropServices.Marshal]::SecureStringToBSTR($securePassword)
-                )
-            }
-
-            # 復号して展開
-            $decryptCmd = "openssl enc -aes-256-cbc -d -pbkdf2 -in '$archivePathWsl' -pass pass:'$Password' | tar -xzf - -C '$RestoreTarget'"
-            wsl -d $WslDistro -e bash -c $decryptCmd
-        }
-        else {
-            # 通常の展開
-            wsl -d $WslDistro -e tar -xzf $archivePathWsl -C $RestoreTarget
-        }
+        # アーカイブの展開
+        wsl -d $WslDistro -e tar -xzf $archivePathWsl -C $RestoreTarget
 
         if ($LASTEXITCODE -eq 0) {
-            Write-Host "Restore completed successfully!" -ForegroundColor Green
+            Write-Host 'Restore completed successfully!' -ForegroundColor Green
             return $true
-        }
-        else {
+        } else {
             Write-Host "Restore failed with exit code: $LASTEXITCODE" -ForegroundColor Red
             return $false
         }
-    }
-    catch {
+    } catch {
         Write-Host "Restore failed: $_" -ForegroundColor Red
         return $false
     }
@@ -1776,29 +1516,28 @@ function Show-AvailableArchives {
     if (Test-Path $ChecksumFile) {
         try {
             $checksums = Get-Content $ChecksumFile -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable
-        }
-        catch { }
+        } catch { }
     }
 
     Write-Host "`nFound $($archives.Count) archive(s):`n"
 
-    $format = "{0,-50} {1,12} {2,-20} {3}"
-    Write-Host ($format -f "Name", "Size", "Date", "Verified") -ForegroundColor Gray
-    Write-Host ("-" * 100) -ForegroundColor Gray
+    $format = '{0,-50} {1,12} {2,-20} {3}'
+    Write-Host ($format -f 'Name', 'Size', 'Date', 'Verified') -ForegroundColor Gray
+    Write-Host ('-' * 100) -ForegroundColor Gray
 
     foreach ($archive in $archives) {
-        $sizeMB = "{0:N1} MB" -f ($archive.Length / 1MB)
-        $date = $archive.LastWriteTime.ToString("yyyy-MM-dd HH:mm")
+        $sizeMB = '{0:N1} MB' -f ($archive.Length / 1MB)
+        $date = $archive.LastWriteTime.ToString('yyyy-MM-dd HH:mm')
 
-        $verifiedStatus = ""
+        $verifiedStatus = ''
         if ($checksums[$archive.Name]) {
-            $verifiedStatus = "Yes"
+            $verifiedStatus = 'Yes'
         }
 
         Write-Host ($format -f $archive.Name, $sizeMB, $date, $verifiedStatus)
     }
 
-    Write-Host ""
+    Write-Host ''
 }
 
 # ============================================================================
@@ -1811,15 +1550,15 @@ function Register-BackupScheduledTask {
         [string]$ScheduleTime
     )
 
-    Write-Host "=== Registering Scheduled Task ===" -ForegroundColor Cyan
+    Write-Host '=== Registering Scheduled Task ===' -ForegroundColor Cyan
 
     if (-not (Test-Administrator)) {
-        Write-Host "ERROR: Administrator privileges required to register scheduled task" -ForegroundColor Red
+        Write-Host 'ERROR: Administrator privileges required to register scheduled task' -ForegroundColor Red
         return $false
     }
 
     try {
-        $taskName = "WSL-Backup"
+        $taskName = 'WSL-Backup'
 
         # 既存タスクの確認
         $existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
@@ -1828,7 +1567,7 @@ function Register-BackupScheduledTask {
             Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
         }
 
-        $action = New-ScheduledTaskAction -Execute "powershell.exe" `
+        $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
             -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$ScriptPath`""
 
         $trigger = New-ScheduledTaskTrigger -Daily -At $ScheduleTime
@@ -1840,37 +1579,36 @@ function Register-BackupScheduledTask {
             -DontStopIfGoingOnBatteries `
             -ExecutionTimeLimit (New-TimeSpan -Hours 4)
 
-        $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+        $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
 
         Register-ScheduledTask -TaskName $taskName `
             -Action $action `
             -Trigger $trigger `
             -Settings $settings `
             -Principal $principal `
-            -Description "WSL Backup - Daily backup of WSL directories to Windows" | Out-Null
+            -Description 'WSL Backup - Daily backup of WSL directories to Windows' | Out-Null
 
         Write-Host "Scheduled task '$taskName' registered successfully!" -ForegroundColor Green
         Write-Host "  Schedule: Daily at $ScheduleTime" -ForegroundColor Gray
         Write-Host "  Script: $ScriptPath" -ForegroundColor Gray
 
         return $true
-    }
-    catch {
+    } catch {
         Write-Host "Failed to register scheduled task: $_" -ForegroundColor Red
         return $false
     }
 }
 
 function Unregister-BackupScheduledTask {
-    Write-Host "=== Unregistering Scheduled Task ===" -ForegroundColor Cyan
+    Write-Host '=== Unregistering Scheduled Task ===' -ForegroundColor Cyan
 
     if (-not (Test-Administrator)) {
-        Write-Host "ERROR: Administrator privileges required" -ForegroundColor Red
+        Write-Host 'ERROR: Administrator privileges required' -ForegroundColor Red
         return $false
     }
 
     try {
-        $taskName = "WSL-Backup"
+        $taskName = 'WSL-Backup'
 
         $existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
         if (-not $existingTask) {
@@ -1881,8 +1619,7 @@ function Unregister-BackupScheduledTask {
         Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
         Write-Host "Scheduled task '$taskName' removed successfully!" -ForegroundColor Green
         return $true
-    }
-    catch {
+    } catch {
         Write-Host "Failed to unregister scheduled task: $_" -ForegroundColor Red
         return $false
     }
@@ -1901,12 +1638,12 @@ function Test-ExclusionPatterns {
     Write-Host "`n=== Exclusion Pattern Test ===" -ForegroundColor Cyan
     Write-Host "Source: $WslSource`n" -ForegroundColor Gray
 
-    Write-Host "Excluded Directories:" -ForegroundColor Yellow
+    Write-Host 'Excluded Directories:' -ForegroundColor Yellow
     foreach ($dir in $Excludes.Dirs) {
         $testPath = Join-Path $WslSource $dir
         $exists = Test-Path $testPath
-        $status = if ($exists) { "[FOUND]" } else { "[NOT FOUND]" }
-        $color = if ($exists) { "Green" } else { "Gray" }
+        $status = if ($exists) { '[FOUND]' } else { '[NOT FOUND]' }
+        $color = if ($exists) { 'Green' } else { 'Gray' }
         Write-Host "  $status $dir" -ForegroundColor $color
     }
 
@@ -1920,8 +1657,8 @@ function Test-ExclusionPatterns {
 
     $excludedCount = 0
     foreach ($dir in $Excludes.Dirs) {
-        $matches = Get-ChildItem -Path $WslSource -Directory -Recurse -Name -Filter $dir -ErrorAction SilentlyContinue
-        $excludedCount += ($matches | Measure-Object).Count
+        $found = Get-ChildItem -Path $WslSource -Directory -Recurse -Name -Filter $dir -ErrorAction SilentlyContinue
+        $excludedCount += ($found | Measure-Object).Count
     }
 
     Write-Host "`nExcluded directories found: $excludedCount" -ForegroundColor Cyan
@@ -1934,7 +1671,7 @@ function Test-ExclusionPatterns {
 function Remove-OldArchives {
     param(
         [string]$ArchiveDest,
-        [int]$KeepDays
+        [int]$KeepCount
     )
 
     $startTime = Get-Date
@@ -1943,9 +1680,9 @@ function Remove-OldArchives {
     $deletedCount = 0
     $deletedSize = 0
 
-    if ($KeepDays -gt 0) {
-        $cutoff = (Get-Date).AddDays(-$KeepDays)
-        $old = Get-ChildItem $ArchiveDest -Filter '*.tar.gz*' -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt $cutoff }
+    if ($KeepCount -gt 0) {
+        $all = Get-ChildItem $ArchiveDest -Filter '*.tar.gz*' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending
+        $old = $all | Select-Object -Skip $KeepCount
         $deletedCount = ($old | Measure-Object).Count
         $deletedSize = ($old | Measure-Object -Property Length -Sum).Sum / 1MB
 
@@ -1955,16 +1692,16 @@ function Remove-OldArchives {
             }
 
             if ($script:DryRunMode) {
-                Write-Log "[DryRun] Would delete $deletedCount old archive(s)" 'INFO'
+                Write-Log "[DryRun] Would delete $deletedCount old archive(s) (keeping newest $KeepCount)" 'INFO'
             }
             else {
                 try {
                     $old | Remove-Item -Force -ErrorAction Stop
-                    Write-Host "  Deleted $deletedCount old archive(s)" -ForegroundColor Green
+                    Write-Host "  Deleted $deletedCount old archive(s) (keeping newest $KeepCount)" -ForegroundColor Green
                     Write-Log "Deleted $deletedCount old archive(s), freed $([math]::Round($deletedSize, 2)) MB" 'INFO'
                 }
                 catch {
-                    Write-Host "  Warning: Failed to delete some archives" -ForegroundColor Yellow
+                    Write-Host '  Warning: Failed to delete some archives' -ForegroundColor Yellow
                     Write-Log "Warning: Failed to delete some archives: $($_.Exception.Message)" 'WARN'
                 }
             }
@@ -1975,8 +1712,8 @@ function Remove-OldArchives {
         }
     }
     else {
-        Write-Host '  Skipped (KeepDays=0)' -ForegroundColor Gray
-        Write-Log 'Cleanup skipped (KeepDays=0)' 'INFO'
+        Write-Host '  Skipped (KeepCount=0, keep all)' -ForegroundColor Gray
+        Write-Log 'Cleanup skipped (KeepCount=0)' 'INFO'
     }
 
     $endTime = Get-Date
@@ -1993,26 +1730,28 @@ function Remove-OldArchives {
 function Remove-OldLogs {
     param(
         [string]$LogDir,
-        [int]$KeepDays
+        [int]$KeepCount
     )
 
-    if ($KeepDays -le 0) {
+    if ($KeepCount -le 0) {
+        return
+    }
+
+    $all = Get-ChildItem $LogDir -Filter '*.log' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending
+    $oldLogs = $all | Select-Object -Skip $KeepCount
+    $count = ($oldLogs | Measure-Object).Count
+
+    if ($count -le 0) {
         return
     }
 
     if ($script:DryRunMode) {
-        Write-Log "[DryRun] Would clean up logs older than $KeepDays days" 'INFO'
+        Write-Log "[DryRun] Would delete $count old log file(s) (keeping newest $KeepCount)" 'INFO'
         return
     }
 
-    $cutoff = (Get-Date).AddDays(-$KeepDays)
-    $oldLogs = Get-ChildItem $LogDir -Filter '*.log' -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt $cutoff }
-    $count = ($oldLogs | Measure-Object).Count
-
-    if ($count -gt 0) {
-        $oldLogs | Remove-Item -Force -ErrorAction SilentlyContinue
-        Write-Log "Deleted $count old log file(s)" 'INFO'
-    }
+    $oldLogs | Remove-Item -Force -ErrorAction SilentlyContinue
+    Write-Log "Deleted $count old log file(s) (keeping newest $KeepCount)" 'INFO'
 }
 
 # ============================================================================
@@ -2026,7 +1765,7 @@ function Write-Summary {
         [hashtable[]]$ArchiveResults,
         [hashtable]$CleanupResult,
         [bool]$SkipArchive,
-        [int]$KeepDays
+        [int]$KeepCount
     )
 
     $endTime = Get-Date
@@ -2039,35 +1778,50 @@ function Write-Summary {
     Write-Log "Total Duration: $([math]::Round($totalDuration, 2)) seconds ($([math]::Round($totalDuration / 60, 2)) minutes)" 'INFO'
     Write-Log '' 'INFO'
 
+    $multiSource = $MirrorResults.Count -gt 1
+
+    Write-Log 'Step 1 - Mirroring:' 'INFO'
     for ($i = 0; $i -lt $MirrorResults.Count; $i++) {
         $mirrorResult = $MirrorResults[$i]
-        Write-Log "Step 1.$($i + 1) - Mirroring ($($script:Config.Sources[$i])):" 'INFO'
-        Write-Log "  Duration: $([math]::Round($mirrorResult.Duration, 2)) seconds" 'INFO'
-        Write-MirrorStats -Stats $mirrorResult.Stats -Prefix '  '
-        Write-Log "  Exit Code: $($mirrorResult.ExitCode)" 'INFO'
-        Write-Log '' 'INFO'
+        $src = $script:Config.Sources[$i]
+        $pad = if ($multiSource) { '    ' } else { '  ' }
+        if ($multiSource) {
+            Write-Log "  [$($i + 1)] $src" 'INFO'
+        } else {
+            Write-Log "  Source: $src" 'INFO'
+        }
+        Write-Log "${pad}Duration: $([math]::Round($mirrorResult.Duration, 2)) seconds" 'INFO'
+        Write-MirrorStats -Stats $mirrorResult.Stats -Prefix $pad
+        Write-Log "${pad}Result: $(Get-RobocopyExitMessage -ExitCode $mirrorResult.ExitCode)" 'INFO'
     }
+    Write-Log '' 'INFO'
 
     Write-Log 'Step 2 - Archive:' 'INFO'
     if ($SkipArchive) {
         Write-Log '  Status: SKIPPED' 'INFO'
-    }
-    else {
+    } else {
         for ($i = 0; $i -lt $ArchiveResults.Count; $i++) {
             $archiveResult = $ArchiveResults[$i]
-            Write-Log "  Source $($i + 1):" 'INFO'
-            Write-Log "    Type: $($archiveResult.Type)" 'INFO'
-            Write-Log "    Duration: $([math]::Round($archiveResult.Duration, 2)) seconds" 'INFO'
-            if ($archiveResult.ArchivePath -and (Test-Path $archiveResult.ArchivePath)) {
+            $src = $script:Config.Sources[$i]
+            $pad = if ($multiSource) { '    ' } else { '  ' }
+            if ($multiSource) {
+                Write-Log "  [$($i + 1)] $src" 'INFO'
+            }
+            Write-Log "${pad}Duration: $([math]::Round($archiveResult.Duration, 2)) seconds" 'INFO'
+            if ($script:DryRunMode) {
+                Write-Log "${pad}Archive: $($archiveResult.ArchiveName)" 'INFO'
+                Write-Log "${pad}Status: SKIPPED (DryRun)" 'INFO'
+            }
+            elseif ($archiveResult.ArchivePath -and (Test-Path $archiveResult.ArchivePath)) {
                 $archiveSize = (Get-Item $archiveResult.ArchivePath).Length / 1MB
-                Write-Log "    Archive: $($archiveResult.ArchiveName)" 'INFO'
-                Write-Log "    Size: $([math]::Round($archiveSize, 2)) MB" 'INFO'
+                Write-Log "${pad}Archive: $($archiveResult.ArchiveName)" 'INFO'
+                Write-Log "${pad}Size: $([math]::Round($archiveSize, 2)) MB" 'INFO'
                 if ($archiveResult.Verified) {
-                    Write-Log "    Integrity: VERIFIED" 'INFO'
+                    Write-Log "${pad}Integrity: VERIFIED" 'INFO'
                 }
             }
             else {
-                Write-Log '    Status: FAILED' 'ERROR'
+                Write-Log "${pad}Status: FAILED" 'ERROR'
             }
         }
     }
@@ -2075,11 +1829,10 @@ function Write-Summary {
 
     Write-Log 'Step 3 - Cleanup:' 'INFO'
     Write-Log "  Duration: $([math]::Round($CleanupResult.Duration, 2)) seconds" 'INFO'
-    if ($KeepDays -gt 0) {
-        Write-Log "  Old archives deleted: $($CleanupResult.DeletedCount)" 'INFO'
-    }
-    else {
-        Write-Log '  Cleanup: Disabled (KeepDays=0)' 'INFO'
+    if ($KeepCount -gt 0) {
+        Write-Log "  Old archives deleted: $($CleanupResult.DeletedCount) (keeping newest $KeepCount)" 'INFO'
+    } else {
+        Write-Log '  Cleanup: Disabled (KeepCount=0, keep all)' 'INFO'
     }
     Write-Log '' 'INFO'
 
@@ -2115,32 +1868,16 @@ function Write-Summary {
 $script:DryRunMode = $DryRun.IsPresent
 
 # 設定ファイルの読み込み
-$configPath = $null
-$possibleConfigFiles = @(
-    (Join-Path $PSScriptRoot 'config.json'),
-    (Join-Path $PSScriptRoot 'config.psd1'),
-    (Join-Path $PSScriptRoot 'config.toml'),
-    (Join-Path $PSScriptRoot 'config.yaml'),
-    (Join-Path $PSScriptRoot 'config.yml')
-)
-foreach ($possiblePath in $possibleConfigFiles) {
-    if (Test-Path $possiblePath) {
-        $configPath = $possiblePath
-        break
-    }
-}
-if (-not $configPath) {
-    $configPath = Join-Path $PSScriptRoot $Script:Constants.ConfigFileName
-}
+$configPath = Join-Path $PSScriptRoot $Script:Constants.ConfigFileName
 
 $configResult = Import-BackupConfig -ConfigPath $configPath
 $script:Config = $configResult.Config
 
 # 設定バリデーションエラーの表示
 if (-not $configResult.Valid) {
-    Write-Host "Configuration errors:" -ForegroundColor Red
-    foreach ($error in $configResult.Errors) {
-        Write-Host "  - $error" -ForegroundColor Red
+    Write-Host 'Configuration errors:' -ForegroundColor Red
+    foreach ($err in $configResult.Errors) {
+        Write-Host "  - $err" -ForegroundColor Red
     }
 
     # 必須項目のエラーの場合は終了
@@ -2167,7 +1904,7 @@ if ($ListArchives) {
     exit $Script:ExitCodes.Success
 }
 
-# タスクス��ジューラー登録モード
+# タスクスケジューラー登録モード
 if ($RegisterScheduledTask) {
     $scriptPath = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.ScriptName }
     $result = Register-BackupScheduledTask -ScriptPath $scriptPath -ScheduleTime $ScheduleTime
@@ -2197,9 +1934,9 @@ if ($Restore) {
         $archiveDest = Join-Path $script:Config.DestRoot 'archive'
         Show-AvailableArchives -ArchiveDest $archiveDest -ChecksumFile (Join-Path $archiveDest $Script:Constants.ChecksumFileName)
 
-        $RestoreArchive = Read-Host "Enter archive filename to restore"
+        $RestoreArchive = Read-Host 'Enter archive filename to restore'
         if (-not $RestoreArchive) {
-            Write-Host "No archive selected. Exiting." -ForegroundColor Yellow
+            Write-Host 'No archive selected. Exiting.' -ForegroundColor Yellow
             exit $Script:ExitCodes.Success
         }
 
@@ -2207,12 +1944,11 @@ if ($Restore) {
     }
 
     if (-not $RestoreTarget) {
-        $RestoreTarget = Read-Host "Enter restore target path (WSL path, e.g., /home/user/restore)"
+        $RestoreTarget = Read-Host 'Enter restore target path (WSL path, e.g., /home/user/restore)'
     }
 
     $result = Invoke-Restore -ArchivePath $RestoreArchive -RestoreTarget $RestoreTarget `
-        -WslDistro $script:Config.WslDistro -Decrypt $script:Config.EnableEncryption `
-        -Password $script:Config.EncryptionPassword
+        -WslDistro $script:Config.WslDistro
 
     exit $(if ($result) { $Script:ExitCodes.Success } else { $Script:ExitCodes.RestoreError })
 }
@@ -2225,9 +1961,9 @@ $script:SkipArchiveFlag = $SkipArchive.IsPresent
 
 # ドライランモードの表示
 if ($script:DryRunMode) {
-    Write-Host "=== DRY RUN MODE ===" -ForegroundColor Magenta
-    Write-Host "実際には何も変更されません。" -ForegroundColor Magenta
-    Write-Host ""
+    Write-Host '=== DRY RUN MODE ===' -ForegroundColor Magenta
+    Write-Host '実際には何も変更されません。' -ForegroundColor Magenta
+    Write-Host ''
 }
 
 # ソースパスの検証
@@ -2241,7 +1977,7 @@ foreach ($sourceDir in $script:Config.Sources) {
 # ロックファイルによる二重実行防止
 $lockFilePath = Get-LockFilePath -WslDistro $script:Config.WslDistro
 if (Test-BackupLock -LockFilePath $lockFilePath) {
-    Write-Host "エラー: バックアップが既に実行中です。" -ForegroundColor Red
+    Write-Host 'エラー: バックアップが既に実行中です。' -ForegroundColor Red
     Write-Host "  ロックファイル: $lockFilePath" -ForegroundColor Red
     exit $Script:ExitCodes.LockError
 }
@@ -2257,27 +1993,24 @@ if (-not (Test-Administrator)) {
         $testPath = Join-Path $testLogDir "test_$PID"
         New-Item -ItemType Directory -Force -Path $testPath -ErrorAction Stop | Out-Null
         Remove-Item -Path $testPath -Force -ErrorAction SilentlyContinue
-    }
-    catch {
+    } catch {
         if ($_.Exception.Message -match 'アクセス|Access|権限|Permission|denied') {
             $needsAdmin = $true
         }
     }
 
     if ($needsAdmin -and $script:Config.AutoElevate) {
-        $args = @()
-        if ($script:SkipArchiveFlag) { $args += "-SkipArchive" }
-        if ($script:DryRunMode) { $args += "-DryRun" }
-        if ($Source) { $args += "-Source `"$Source`"" }
-        if ($Incremental) { $args += "-Incremental" }
-        if ($TimeoutMinutes -ne 120) { $args += "-TimeoutMinutes $TimeoutMinutes" }
+        $elevateArgs = @()
+        if ($script:SkipArchiveFlag) { $elevateArgs += '-SkipArchive' }
+        if ($script:DryRunMode) { $elevateArgs += '-DryRun' }
+        if ($Source) { $elevateArgs += "-Source `"$Source`"" }
+        if ($TimeoutMinutes -ne 120) { $elevateArgs += "-TimeoutMinutes $TimeoutMinutes" }
 
-        if (Request-Administrator -ScriptPath $scriptPath -Arguments $args) {
+        if (Request-Administrator -ScriptPath $scriptPath -Arguments $elevateArgs) {
             exit $Script:ExitCodes.PermissionError
         }
-    }
-    elseif ($needsAdmin) {
-        Write-Host "エラー: 管理者権限が必要ですが、自動昇格が無効です。" -ForegroundColor Red
+    } elseif ($needsAdmin) {
+        Write-Host 'エラー: 管理者権限が必要ですが、自動昇格が無効です。' -ForegroundColor Red
         exit $Script:ExitCodes.PermissionError
     }
 }
@@ -2285,7 +2018,7 @@ if (-not (Test-Administrator)) {
 # ロックファイルの作成
 if (-not $script:DryRunMode) {
     if (-not (New-BackupLock -LockFilePath $lockFilePath)) {
-        Write-Host "エラー: ロックの取得に失敗しました。" -ForegroundColor Red
+        Write-Host 'エラー: ロックの取得に失敗しました。' -ForegroundColor Red
         exit $Script:ExitCodes.LockError
     }
 }
@@ -2308,8 +2041,7 @@ try {
             New-Item -ItemType Directory -Force -Path $MirrorDest -ErrorAction Stop | Out-Null
             New-Item -ItemType Directory -Force -Path $ArchiveDest -ErrorAction Stop | Out-Null
             New-Item -ItemType Directory -Force -Path $script:LogDir -ErrorAction Stop | Out-Null
-        }
-        catch {
+        } catch {
             Write-Host "エラー: ディレクトリの作成に失敗しました: $($_.Exception.Message)" -ForegroundColor Red
             exit $Script:ExitCodes.PermissionError
         }
@@ -2329,14 +2061,11 @@ try {
     if ($script:DryRunMode) {
         Write-Log 'Mode: DRY RUN' 'INFO'
     }
-    if ($Incremental) {
-        Write-Log 'Archive Type: INCREMENTAL' 'INFO'
-    }
     Write-Log "Start Time: $($ScriptStartTime.ToString($Script:Constants.LogDateFormat))" 'INFO'
 
     # WSLの状態確認
-    Show-Progress -Activity "WSL Backup" -Status "Checking WSL health..." -PercentComplete 5
-    Write-Host "Checking WSL health..." -ForegroundColor Gray
+    Show-Progress -Activity 'WSL Backup' -Status 'Checking WSL health...' -PercentComplete 5
+    Write-Host 'Checking WSL health...' -ForegroundColor Gray
     if (-not (Test-WslHealth -Distro $script:Config.WslDistro)) {
         Write-Host "ERROR: WSL is not responding or distribution '$($script:Config.WslDistro)' is not available" -ForegroundColor Red
         exit $Script:ExitCodes.WslError
@@ -2345,13 +2074,13 @@ try {
 
     # タイムアウトチェック
     if (Test-Timeout) {
-        Write-Host "ERROR: Operation timed out" -ForegroundColor Red
+        Write-Host 'ERROR: Operation timed out' -ForegroundColor Red
         exit $Script:ExitCodes.TimeoutError
     }
 
     # ディスク容量チェック
     if (-not (Test-DiskSpace -Path $script:Config.DestRoot -RequiredGB $script:Config.RequiredFreeSpaceGB)) {
-        Write-Host "ERROR: Insufficient disk space" -ForegroundColor Red
+        Write-Host 'ERROR: Insufficient disk space' -ForegroundColor Red
         exit $Script:ExitCodes.DiskSpaceError
     }
 
@@ -2376,7 +2105,7 @@ try {
     for ($i = 0; $i -lt $totalSources; $i++) {
         # タイムアウトチェック
         if (Test-Timeout) {
-            Write-Host "ERROR: Operation timed out during mirroring" -ForegroundColor Red
+            Write-Host 'ERROR: Operation timed out during mirroring' -ForegroundColor Red
             exit $Script:ExitCodes.TimeoutError
         }
 
@@ -2387,12 +2116,11 @@ try {
 
         $stepNum = $i + 1
         $progress = [math]::Round(($stepNum / $totalSteps) * 100)
-        Show-Progress -Activity "WSL Backup" -Status "Mirroring $sourceName..." -PercentComplete $progress
+        Show-Progress -Activity 'WSL Backup' -Status "Mirroring $sourceName..." -PercentComplete $progress
 
         if ($totalSources -eq 1) {
             Write-Host "[1/3] Mirroring $sourceDir..." -ForegroundColor Cyan
-        }
-        else {
+        } else {
             Write-Host "[1.$($i + 1)/$totalSources] Mirroring $sourceDir..." -ForegroundColor Cyan
         }
 
@@ -2418,14 +2146,13 @@ try {
         Write-Host '[2/3] Creating archive... (SKIPPED)' -ForegroundColor Gray
         Write-Log '=== Step 2: Archive Creation Skipped ===' 'INFO'
         for ($i = 0; $i -lt $totalSources; $i++) {
-            $archiveResults += @{ Duration = 0; ArchiveName = ''; ArchivePath = $null; TarErrors = @(); Verified = $false; Type = 'none' }
+            $archiveResults += @{ Duration = 0; ArchiveName = ''; ArchivePath = $null; TarErrors = @(); Verified = $false }
         }
-    }
-    else {
+    } else {
         for ($i = 0; $i -lt $totalSources; $i++) {
             # タイムアウトチェック
             if (Test-Timeout) {
-                Write-Host "ERROR: Operation timed out during archive creation" -ForegroundColor Red
+                Write-Host 'ERROR: Operation timed out during archive creation' -ForegroundColor Red
                 exit $Script:ExitCodes.TimeoutError
             }
 
@@ -2434,43 +2161,16 @@ try {
 
             $stepNum = $totalSources + $i + 1
             $progress = [math]::Round(($stepNum / $totalSteps) * 100)
-            Show-Progress -Activity "WSL Backup" -Status "Creating archive for $sourceName..." -PercentComplete $progress
+            Show-Progress -Activity 'WSL Backup' -Status "Creating archive for $sourceName..." -PercentComplete $progress
 
             if ($totalSources -eq 1) {
                 Write-Host "[2/3] Creating archive for $sourceDir..." -ForegroundColor Cyan
-            }
-            else {
+            } else {
                 Write-Host "[2.$($i + 1)/$totalSources] Creating archive for $sourceDir..." -ForegroundColor Cyan
             }
 
-            # 増分バックアップの判定
-            $isIncremental = $Incremental.IsPresent
-            $sinceDate = [datetime]::MinValue
-
-            if ($isIncremental) {
-                $lastFullDate = Get-LastFullBackupDate -HistoryPath $historyPath -SourceName $sourceName
-                if ($lastFullDate) {
-                    $daysSinceLastFull = ((Get-Date) - $lastFullDate).Days
-                    if ($daysSinceLastFull -ge $script:Config.IncrementalBaseDays) {
-                        # フルバックアップが必要
-                        $isIncremental = $false
-                        Write-Log "Full backup required (last full: $($lastFullDate.ToString('yyyy-MM-dd')))" 'INFO'
-                    }
-                    else {
-                        $sinceDate = $lastFullDate
-                    }
-                }
-                else {
-                    # 初回はフルバックアップ
-                    $isIncremental = $false
-                    Write-Log "First backup - creating full archive" 'INFO'
-                }
-            }
-
             $archiveResult = New-Archive -WslDistro $script:Config.WslDistro -SourceDir $sourceDir `
-                -ArchiveDest $ArchiveDest -Timestamp $Timestamp -Verify $script:Config.VerifyArchive `
-                -CompressionLevel $script:Config.CompressionLevel -Encrypt $script:Config.EnableEncryption `
-                -Password $script:Config.EncryptionPassword -Incremental $isIncremental -SinceDate $sinceDate
+                -ArchiveDest $ArchiveDest -Timestamp $Timestamp -Verify $script:Config.VerifyArchive
             $archiveResults += $archiveResult
 
             # 履歴に保存
@@ -2479,7 +2179,6 @@ try {
                     SourceName  = $sourceName
                     SourcePath  = $sourceDir
                     ArchiveName = $archiveResult.ArchiveName
-                    Type        = $archiveResult.Type
                     Timestamp   = (Get-Date).ToString('o')
                     Success     = $true
                     Size        = (Get-Item $archiveResult.ArchivePath).Length
@@ -2489,17 +2188,17 @@ try {
     }
 
     # クリーンアップ
-    Show-Progress -Activity "WSL Backup" -Status "Cleanup..." -PercentComplete 95
+    Show-Progress -Activity 'WSL Backup' -Status 'Cleanup...' -PercentComplete 95
     Write-Host '[3/3] Cleanup...' -ForegroundColor Cyan
-    $cleanupResult = Remove-OldArchives -ArchiveDest $ArchiveDest -KeepDays $script:Config.KeepDays
+    $cleanupResult = Remove-OldArchives -ArchiveDest $ArchiveDest -KeepCount $script:Config.KeepCount
 
     # ログファイルのクリーンアップ
-    Remove-OldLogs -LogDir $script:LogDir -KeepDays $script:Config.LogKeepDays
+    Remove-OldLogs -LogDir $script:LogDir -KeepCount $script:Config.LogKeepCount
 
     Complete-Progress
     Write-Host 'Done.' -ForegroundColor Green
     Write-Summary -ScriptStartTime $ScriptStartTime -MirrorResults $mirrorResults -ArchiveResults $archiveResults `
-        -CleanupResult $cleanupResult -SkipArchive $script:SkipArchiveFlag -KeepDays $script:Config.KeepDays
+        -CleanupResult $cleanupResult -SkipArchive $script:SkipArchiveFlag -KeepCount $script:Config.KeepCount
 
     # 通知
     $hasErrors = $false
@@ -2517,21 +2216,18 @@ try {
     $message = "Files: $totalFiles, Archives: $([math]::Round($totalSize, 1)) MB"
 
     if ($hasErrors) {
-        Send-BackupNotification -Title "WSL Backup 完了（警告あり）" -Message $message -Success $false
-    }
-    else {
-        Send-BackupNotification -Title "WSL Backup 完了" -Message $message -Success $true
+        Send-BackupNotification -Title 'WSL Backup 完了（警告あり）' -Message $message -Success $false
+    } else {
+        Send-BackupNotification -Title 'WSL Backup 完了' -Message $message -Success $true
     }
 
     exit $Script:ExitCodes.Success
-}
-catch {
+} catch {
     Write-Host "ERROR: $_" -ForegroundColor Red
     Write-Log "Unhandled error: $_" 'ERROR'
-    Send-BackupNotification -Title "WSL Backup 失敗" -Message "$_" -Success $false
+    Send-BackupNotification -Title 'WSL Backup 失敗' -Message "$_" -Success $false
     exit $Script:ExitCodes.MirrorError
-}
-finally {
+} finally {
     Complete-Progress
 
     # ロックファイルの削除

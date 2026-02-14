@@ -41,7 +41,7 @@ BeforeAll {
             WslDistro = @{ Type = 'string'; Required = $true; Pattern = '^[a-zA-Z0-9_-]+$' }
             Sources = @{ Type = 'array'; Required = $true; MinItems = 1 }
             DestRoot = @{ Type = 'string'; Required = $true }
-            KeepDays = @{ Type = 'int'; Min = 0; Max = 3650; Default = 15 }
+            KeepCount = @{ Type = 'int'; Min = 0; Max = 9999; Default = 15 }
         }
     }
 
@@ -321,28 +321,28 @@ Describe 'Test-ConfigValue' {
 
     Context 'Integer validation' {
         It 'Validates valid integer' {
-            $result = Test-ConfigValue -Key 'KeepDays' -Value 30 -Schema $Script:ConfigSchema
+            $result = Test-ConfigValue -Key 'KeepCount' -Value 30 -Schema $Script:ConfigSchema
             $result.Valid | Should -Be $true
             $result.Value | Should -Be 30
         }
 
         It 'Validates integer at minimum' {
-            $result = Test-ConfigValue -Key 'KeepDays' -Value 0 -Schema $Script:ConfigSchema
+            $result = Test-ConfigValue -Key 'KeepCount' -Value 0 -Schema $Script:ConfigSchema
             $result.Valid | Should -Be $true
         }
 
         It 'Rejects integer below minimum' {
-            $result = Test-ConfigValue -Key 'KeepDays' -Value -1 -Schema $Script:ConfigSchema
+            $result = Test-ConfigValue -Key 'KeepCount' -Value -1 -Schema $Script:ConfigSchema
             $result.Valid | Should -Be $false
         }
 
         It 'Rejects integer above maximum' {
-            $result = Test-ConfigValue -Key 'KeepDays' -Value 5000 -Schema $Script:ConfigSchema
+            $result = Test-ConfigValue -Key 'KeepCount' -Value 10000 -Schema $Script:ConfigSchema
             $result.Valid | Should -Be $false
         }
 
         It 'Returns default for null value' {
-            $result = Test-ConfigValue -Key 'KeepDays' -Value $null -Schema $Script:ConfigSchema
+            $result = Test-ConfigValue -Key 'KeepCount' -Value $null -Schema $Script:ConfigSchema
             $result.Valid | Should -Be $true
             $result.Value | Should -Be 15
         }
@@ -490,9 +490,9 @@ Describe 'Constants' {
         $Script:Constants.RobocopySuccessMaxExitCode | Should -Be 7
     }
 
-    It 'Has valid default keep days' {
-        $Script:Constants.DefaultKeepDays | Should -BeGreaterThan 0
-        $Script:Constants.DefaultLogKeepDays | Should -BeGreaterThan 0
+    It 'Has valid default keep counts' {
+        $Script:Constants.DefaultKeepCount | Should -BeGreaterThan 0
+        $Script:Constants.DefaultLogKeepCount | Should -BeGreaterThan 0
     }
 
     It 'Has valid timestamp formats' {
