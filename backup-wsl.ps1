@@ -1,9 +1,12 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    WSL -> Windows バックアップスクリプト
+    WSL/Windows バックアップスクリプト
 .DESCRIPTION
-    WSLのディレクトリをWindowsにミラーリング＆アーカイブ保存
+    WSLおよびWindowsのディレクトリをミラーリング＆アーカイブ保存
+    - WSLソース（/始まり）→ tar.gz アーカイブ（権限情報保持）
+    - Windowsソース（C:\始まり）→ zip アーカイブ
+    - WSL/Windowsの混在ソースをサポート
     - 複数ソースディレクトリのサポート
     - 外部設定ファイル（config.psd1）対応
     - ドライランモード、二重実行防止、整合性検証など堅牢な設計
@@ -113,7 +116,7 @@ $Script:Constants = @{
     MinRequiredFreeSpaceGB     = 1
     HistoryFileName            = 'backup-history.json'
     ChecksumFileName           = 'checksums.json'
-    Version                    = '2.0.0'
+    Version                    = '2.1.0'
 }
 
 # ============================================================================
@@ -123,15 +126,16 @@ $Script:Constants = @{
 $Script:ConfigSchema = @{
     WslDistro            = @{
         Type     = 'string'
-        Required = $true
+        Required = $false
         Pattern  = '^[a-zA-Z0-9_-]+$'
+        Default  = 'Ubuntu'
         Message  = 'WslDistro must contain only alphanumeric characters, underscores, and hyphens'
     }
     Sources              = @{
         Type     = 'array'
         Required = $true
         MinItems = 1
-        Message  = 'Sources must be a non-empty array of paths'
+        Message  = 'Sources must be a non-empty array of paths or @{ Path = "..."; Name = "..." } entries'
     }
     DestRoot             = @{
         Type     = 'string'
@@ -410,8 +414,7 @@ function Request-Administrator {
 # ============================================================================
 
 function Get-LockFilePath {
-    param([string]$WslDistro)
-    return Join-Path $env:TEMP "backup-wsl-$WslDistro.lock"
+    return Join-Path $env:TEMP 'backup-wsl.lock'
 }
 
 function Test-BackupLock {
@@ -602,24 +605,40 @@ function Test-SafePath {
 function Test-SourcePath {
     param(
         [string]$SourcePath,
-        [string]$WslDistro
+        [string]$SourceType
     )
 
-    # WSLパスの基本的なバリデーション
     if ([string]::IsNullOrWhiteSpace($SourcePath)) {
         return $false
     }
 
     # パストラバーサル攻撃の検出
-    if ($SourcePath -match '\.\.' -or $SourcePath -match '//') {
+    if ($SourcePath -match '\.\.') {
         Write-Log "Invalid source path (possible path traversal): $SourcePath" 'ERROR'
         return $false
     }
 
-    # 絶対パスであることを確認
-    if (-not $SourcePath.StartsWith('/')) {
-        Write-Log "Source path must be absolute (start with /): $SourcePath" 'ERROR'
-        return $false
+    switch ($SourceType) {
+        'wsl' {
+            if ($SourcePath -match '//') {
+                Write-Log "Invalid WSL path (double slash): $SourcePath" 'ERROR'
+                return $false
+            }
+            if (-not $SourcePath.StartsWith('/')) {
+                Write-Log "WSL source path must be absolute (start with /): $SourcePath" 'ERROR'
+                return $false
+            }
+        }
+        'windows' {
+            if ($SourcePath -notmatch '^[A-Za-z]:\\') {
+                Write-Log "Windows source path must be absolute (e.g., C:\...): $SourcePath" 'ERROR'
+                return $false
+            }
+        }
+        default {
+            Write-Log "Unknown source type for path: $SourcePath" 'ERROR'
+            return $false
+        }
     }
 
     return $true
@@ -641,6 +660,25 @@ function Test-ArchiveIntegrity {
         return $LASTEXITCODE -eq 0
     } catch {
         Write-Log "Archive integrity check failed: $_" 'WARN'
+        return $false
+    }
+}
+
+function Test-ZipIntegrity {
+    param([string]$ArchivePath)
+
+    if (-not (Test-Path $ArchivePath)) {
+        return $false
+    }
+
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($ArchivePath)
+        $entryCount = $zip.Entries.Count
+        $zip.Dispose()
+        return $entryCount -gt 0
+    } catch {
+        Write-Log "Zip integrity check failed: $_" 'WARN'
         return $false
     }
 }
@@ -722,9 +760,97 @@ function ConvertTo-WslPath {
     return "/mnt/$driveLetter$pathWithoutDrive"
 }
 
+function Resolve-SourcePath {
+    param(
+        [hashtable]$Entry,
+        [string]$WslDistro
+    )
+    if ($Entry.Type -eq 'windows') {
+        return $Entry.Path
+    }
+    return "\\wsl.localhost\$WslDistro" + ($Entry.Path -replace '/', '\')
+}
+
 function Get-SafeSourceName {
     param([string]$SourceDir)
     return ($SourceDir -replace '.*/', '') -replace "'", "'\''"
+}
+
+function Get-SourceType {
+    param([string]$Path)
+    if ($Path -match '^[A-Za-z]:\\') { return 'windows' }
+    if ($Path.StartsWith('/')) { return 'wsl' }
+    return $null
+}
+
+function Get-SourceName {
+    param([string]$Path, [string]$Type)
+    if ($Type -eq 'windows') {
+        return Split-Path $Path -Leaf
+    }
+    return $Path -replace '.*/', ''
+}
+
+function Resolve-SourceEntries {
+    param([array]$Sources)
+
+    $entries = @()
+    $errors = @()
+
+    for ($i = 0; $i -lt $Sources.Count; $i++) {
+        $src = $Sources[$i]
+        if ($src -is [hashtable]) {
+            if (-not $src.Path) {
+                $errors += "Sources[$i]: hashtable entry must have a 'Path' property"
+                continue
+            }
+            $path = [string]$src.Path
+            $type = Get-SourceType -Path $path
+            if (-not $type) {
+                $errors += "Sources[$i]: Path must be an absolute WSL path (starting with /) or Windows path (e.g., C:\...)"
+                continue
+            }
+            $name = if ($src.Name) { [string]$src.Name } else { Get-SourceName -Path $path -Type $type }
+            if ($name -notmatch '^[a-zA-Z0-9._-]+$') {
+                $errors += "Sources[$i]: Name '$name' contains invalid characters (allowed: alphanumeric, dot, underscore, hyphen)"
+                continue
+            }
+            $entries += @{ Path = $path; Name = $name; Type = $type }
+        } elseif ($src -is [string]) {
+            if (-not $src) {
+                $errors += "Sources[$i]: empty path"
+                continue
+            }
+            $type = Get-SourceType -Path $src
+            if (-not $type) {
+                $errors += "Sources[$i]: Path '$src' must be an absolute WSL path (starting with /) or Windows path (e.g., C:\...)"
+                continue
+            }
+            $name = Get-SourceName -Path $src -Type $type
+            $entries += @{ Path = $src; Name = $name; Type = $type }
+        } else {
+            $errors += "Sources[$i]: must be a string path or a hashtable with Path and optional Name properties"
+        }
+    }
+
+    if ($entries.Count -gt 1) {
+        $dupes = $entries | ForEach-Object { $_.Name } | Group-Object | Where-Object { $_.Count -gt 1 }
+        if ($dupes) {
+            $dupeDetails = foreach ($dupe in $dupes) {
+                $conflicting = for ($j = 0; $j -lt $entries.Count; $j++) {
+                    if ($entries[$j].Name -eq $dupe.Name) { $entries[$j].Path }
+                }
+                "'$($dupe.Name)' ($($conflicting -join ', '))"
+            }
+            $errors += "Duplicate source names detected: $($dupeDetails -join '; '). Use @{ Path = '...'; Name = '...' } to specify unique aliases."
+        }
+    }
+
+    return @{
+        Valid   = $errors.Count -eq 0
+        Errors  = $errors
+        Entries = $entries
+    }
 }
 
 function Read-MirrorIgnore {
@@ -856,7 +982,7 @@ function Send-WebhookNotification {
                     color  = $color
                     title  = "$emoji $Title"
                     text   = $Message
-                    footer = "WSL Backup Script v$($Script:Constants.Version)"
+                    footer = "Backup Script v$($Script:Constants.Version)"
                     ts     = [int][double]::Parse((Get-Date -UFormat %s))
                 }
             )
@@ -870,8 +996,64 @@ function Send-WebhookNotification {
 }
 
 # ============================================================================
-# 除外ディレクトリ削除
+# 除外アイテム削除
 # ============================================================================
+
+function Remove-ExcludedFiles {
+    param(
+        [string]$MirrorDest,
+        [string[]]$ExcludeFiles,
+        [string]$Timestamp
+    )
+
+    if (-not $ExcludeFiles -or $ExcludeFiles.Count -eq 0) { return @() }
+
+    $matchedFiles = @()
+    foreach ($pattern in $ExcludeFiles) {
+        $found = Get-ChildItem -Path $MirrorDest -Recurse -File -Filter $pattern -ErrorAction SilentlyContinue
+        if ($found) { $matchedFiles += $found }
+    }
+
+    if ($matchedFiles.Count -eq 0) { return @() }
+
+    if ($script:DryRunMode) {
+        foreach ($file in $matchedFiles) {
+            Write-Log "[DryRun] Would delete excluded file: $($file.FullName)" 'INFO'
+        }
+        return @()
+    }
+
+    $failedDeletions = @()
+    foreach ($file in $matchedFiles) {
+        try {
+            Remove-Item -Path $file.FullName -Force -ErrorAction Stop
+        } catch {
+            $failedDeletions += @{
+                Path  = $file.FullName
+                Error = $_.Exception.Message
+                Time  = Get-Date -Format $Script:Constants.LogDateFormat
+            }
+        }
+    }
+
+    if ($matchedFiles.Count -gt $failedDeletions.Count) {
+        $deleted = $matchedFiles.Count - $failedDeletions.Count
+        Write-Log "Deleted $deleted excluded file(s) from mirror destination" 'INFO'
+    }
+
+    if ($failedDeletions.Count -gt 0) {
+        Write-Log "Warning: Failed to delete $($failedDeletions.Count) excluded file(s)" 'WARN'
+
+        $auditLog = Join-Path $script:LogDir "cleanup_audit_$Timestamp.log"
+        $logContent = "=== File Cleanup Audit Log ===`nTimestamp: $(Get-Date -Format $Script:Constants.LogDateFormat)`n"
+        foreach ($item in $failedDeletions) {
+            $logContent += "`n[$($item.Time)] $($item.Path)`n  Error: $($item.Error)"
+        }
+        $logContent | Out-File -FilePath $auditLog -Encoding UTF8 -Append
+    }
+
+    return $failedDeletions
+}
 
 function Remove-ExcludedDirectories {
     param(
@@ -880,30 +1062,41 @@ function Remove-ExcludedDirectories {
         [string]$Timestamp
     )
 
+    if (-not $ExcludeDirs -or $ExcludeDirs.Count -eq 0) { return @() }
+
+    $matchedDirs = @()
+    foreach ($pattern in $ExcludeDirs) {
+        $found = Get-ChildItem -Path $MirrorDest -Recurse -Directory -Filter $pattern -ErrorAction SilentlyContinue
+        if ($found) { $matchedDirs += $found }
+    }
+
+    if ($matchedDirs.Count -eq 0) { return @() }
+
     if ($script:DryRunMode) {
-        foreach ($excludeDir in $ExcludeDirs) {
-            $excludePath = Join-Path $MirrorDest $excludeDir
-            if (Test-Path $excludePath) {
-                Write-Log "[DryRun] Would delete excluded directory: $excludePath" 'INFO'
-            }
+        foreach ($dir in $matchedDirs) {
+            Write-Log "[DryRun] Would delete excluded directory: $($dir.FullName)" 'INFO'
         }
         return @()
     }
 
     $failedDeletions = @()
-    foreach ($excludeDir in $ExcludeDirs) {
-        $excludePath = Join-Path $MirrorDest $excludeDir
-        if (Test-Path $excludePath) {
+    foreach ($dir in $matchedDirs) {
+        if (Test-Path $dir.FullName) {
             try {
-                Remove-Item -Path $excludePath -Recurse -Force -ErrorAction Stop
+                Remove-Item -Path $dir.FullName -Recurse -Force -ErrorAction Stop
             } catch {
                 $failedDeletions += @{
-                    Path  = $excludePath
+                    Path  = $dir.FullName
                     Error = $_.Exception.Message
                     Time  = Get-Date -Format $Script:Constants.LogDateFormat
                 }
             }
         }
+    }
+
+    if ($matchedDirs.Count -gt $failedDeletions.Count) {
+        $deleted = $matchedDirs.Count - $failedDeletions.Count
+        Write-Log "Deleted $deleted excluded directory/directories from mirror destination" 'INFO'
     }
 
     if ($failedDeletions.Count -gt 0) {
@@ -1027,7 +1220,7 @@ function New-ChangeReport {
         return $null
     }
 
-    $reportPath = Join-Path $script:LogDir "changes_${SourceName}_$Timestamp.txt"
+    $reportPath = Join-Path $script:LogDir "changes_${SourceName}_$Timestamp.log"
 
     $report = @"
 === Change Report ===
@@ -1235,6 +1428,7 @@ function Invoke-Mirroring {
     Write-SecureLog "Destination: $MirrorDest" 'INFO'
 
     $failedDeletions = Remove-ExcludedDirectories -MirrorDest $MirrorDest -ExcludeDirs $Excludes.Dirs -Timestamp $Timestamp
+    $failedDeletions += Remove-ExcludedFiles -MirrorDest $MirrorDest -ExcludeFiles $Excludes.Files -Timestamp $Timestamp
 
     $robocopyLog = Join-Path $script:LogDir "robocopy_$Timestamp.log"
 
@@ -1333,17 +1527,20 @@ function New-Archive {
         [string]$SourceDir,
         [string]$ArchiveDest,
         [string]$Timestamp,
-        [bool]$Verify
+        [bool]$Verify,
+        [string]$SourceName,
+        [hashtable]$Excludes
     )
 
     $startTime = Get-Date
     Write-Log '=== Step 2: Archive Creation Started ===' 'INFO'
 
-    $targetName = Get-SafeSourceName -SourceDir $SourceDir
+    $folderName = $SourceDir -replace '.*/', ''
     $parentDir = $SourceDir -replace '/[^/]+$', ''
     if (-not $parentDir) { $parentDir = '/' }
+    if (-not $SourceName) { $SourceName = $folderName }
 
-    $archiveName = "${targetName}_$Timestamp.tar.gz"
+    $archiveName = "${SourceName}_$Timestamp.tar.gz"
 
     $archivePath = Join-Path $ArchiveDest $archiveName
     $archivePathWsl = ConvertTo-WslPath -WindowsPath $archivePath
@@ -1359,15 +1556,29 @@ function New-Archive {
         }
     }
 
-    Show-Progress -Activity 'Creating Archive' -Status "Compressing $targetName..." -PercentComplete 20
+    Show-Progress -Activity 'Creating Archive' -Status "Compressing $SourceName..." -PercentComplete 20
 
     $tarErrorLog = Join-Path $script:LogDir "tar_errors_$Timestamp.log"
     $tarErrorLogWsl = ConvertTo-WslPath -WindowsPath $tarErrorLog
 
-    $safeTargetName = $targetName -replace "'", "'\\''"
+    $safeFolderName = $folderName -replace "'", "'\\''"
     $safeParentDir = $parentDir -replace "'", "'\\''"
 
-    $tarCmd = "GZIP=-6 tar -czf '$archivePathWsl' --ignore-failed-read -C '$safeParentDir' '$safeTargetName' 2>'$tarErrorLogWsl'"
+    # --exclude オプションの構築
+    $excludeArgs = ''
+    if ($Excludes) {
+        foreach ($dir in $Excludes.Dirs) {
+            $excludeArgs += " --exclude='$dir'"
+        }
+        foreach ($file in $Excludes.Files) {
+            $excludeArgs += " --exclude='$file'"
+        }
+        if ($excludeArgs) {
+            Write-Log "Archive excludes: $($excludeArgs.Trim())" 'INFO'
+        }
+    }
+
+    $tarCmd = "GZIP=-6 tar -czf '$archivePathWsl'$excludeArgs --ignore-failed-read -C '$safeParentDir' '$safeFolderName' 2>'$tarErrorLogWsl'"
 
     Invoke-WithRetry -OperationName 'Archive creation' -MaxRetries 2 -DelaySeconds 3 -ScriptBlock {
         wsl -d $WslDistro -e bash -c $tarCmd
@@ -1429,6 +1640,110 @@ function New-Archive {
     }
 }
 
+function New-WindowsArchive {
+    param(
+        [string]$MirrorSource,
+        [string]$ArchiveDest,
+        [string]$Timestamp,
+        [bool]$Verify,
+        [string]$SourceName
+    )
+
+    $startTime = Get-Date
+    Write-Log '=== Step 2: Archive Creation (Windows/zip) Started ===' 'INFO'
+
+    if (-not $SourceName) { $SourceName = Split-Path $MirrorSource -Leaf }
+    $archiveName = "${SourceName}_$Timestamp.zip"
+    $archivePath = Join-Path $ArchiveDest $archiveName
+
+    if ($script:DryRunMode) {
+        Write-Log "[DryRun] Would create archive: $archivePath" 'INFO'
+        return @{
+            Duration    = 0
+            ArchiveName = $archiveName
+            ArchivePath = $archivePath
+            TarErrors   = @()
+            Verified    = $false
+        }
+    }
+
+    if (-not (Test-Path $MirrorSource)) {
+        Write-Host "  ERROR: Mirror source not found: $MirrorSource" -ForegroundColor Red
+        Write-Log "ERROR: Mirror source not found: $MirrorSource" 'ERROR'
+        return @{
+            Duration    = 0
+            ArchiveName = $archiveName
+            ArchivePath = $null
+            TarErrors   = @()
+            Verified    = $false
+        }
+    }
+
+    Show-Progress -Activity 'Creating Archive' -Status "Compressing $SourceName..." -PercentComplete 20
+
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+        Invoke-WithRetry -OperationName 'Archive creation' -MaxRetries 2 -DelaySeconds 3 -ScriptBlock {
+            if (Test-Path $archivePath) { Remove-Item $archivePath -Force }
+            [System.IO.Compression.ZipFile]::CreateFromDirectory(
+                $MirrorSource,
+                $archivePath,
+                [System.IO.Compression.CompressionLevel]::Optimal,
+                $false
+            )
+        }
+    } catch {
+        Write-Host "  ERROR: Archive creation failed: $_" -ForegroundColor Red
+        Write-Log "ERROR: Archive creation failed: $_" 'ERROR'
+        return @{
+            Duration    = (New-TimeSpan -Start $startTime -End (Get-Date)).TotalSeconds
+            ArchiveName = $archiveName
+            ArchivePath = $null
+            TarErrors   = @("$_")
+            Verified    = $false
+        }
+    }
+
+    Show-Progress -Activity 'Creating Archive' -Status 'Finalizing...' -PercentComplete 90
+
+    $endTime = Get-Date
+    $duration = ($endTime - $startTime).TotalSeconds
+
+    $verified = $false
+    if (Test-Path $archivePath) {
+        $size = (Get-Item $archivePath).Length / 1MB
+        Write-Host "  OK: $archiveName ($('{0:N1}' -f $size) MB)" -ForegroundColor Green
+        Write-Log "Archive created successfully: $archiveName" 'INFO'
+        Write-Log "  Size: $([math]::Round($size, 2)) MB" 'INFO'
+        Write-Log "  Duration: $([math]::Round($duration, 2)) seconds" 'INFO'
+
+        Save-ArchiveChecksum -ArchivePath $archivePath -ArchiveDest $ArchiveDest
+
+        if ($Verify) {
+            Write-Host '  Verifying archive...' -ForegroundColor Gray
+            $verified = Test-ZipIntegrity -ArchivePath $archivePath
+            if ($verified) {
+                Write-Host '  Integrity check: OK' -ForegroundColor Green
+                Write-Log '  Integrity check: PASSED' 'INFO'
+            } else {
+                Write-Host '  Integrity check: FAILED' -ForegroundColor Red
+                Write-Log '  Integrity check: FAILED' 'WARN'
+            }
+        }
+    } else {
+        Write-Host '  ERROR: Archive not created' -ForegroundColor Red
+        Write-Log 'ERROR: Archive creation failed' 'ERROR'
+    }
+
+    return @{
+        Duration    = $duration
+        ArchiveName = $archiveName
+        ArchivePath = $archivePath
+        TarErrors   = @()
+        Verified    = $verified
+    }
+}
+
 # ============================================================================
 # リストア機能
 # ============================================================================
@@ -1447,20 +1762,24 @@ function Invoke-Restore {
         return $false
     }
 
+    $isZip = $ArchivePath -match '\.zip$'
+    $restoreType = if ($isZip) { 'windows' } else { 'wsl' }
+
     # リストア先の確認
     if (-not $RestoreTarget) {
         Write-Host 'ERROR: RestoreTarget is required' -ForegroundColor Red
         return $false
     }
 
-    # WSLパスのバリデーション
-    if (-not (Test-SourcePath -SourcePath $RestoreTarget -WslDistro $WslDistro)) {
+    # パスのバリデーション
+    if (-not (Test-SourcePath -SourcePath $RestoreTarget -SourceType $restoreType)) {
         Write-Host 'ERROR: Invalid restore target path' -ForegroundColor Red
         return $false
     }
 
     Write-Host "Archive: $ArchivePath" -ForegroundColor Gray
     Write-Host "Restore to: $RestoreTarget" -ForegroundColor Gray
+    Write-Host "Type: $restoreType" -ForegroundColor Gray
 
     if ($script:DryRunMode) {
         Write-Host "[DryRun] Would restore archive to $RestoreTarget" -ForegroundColor Cyan
@@ -1475,20 +1794,26 @@ function Invoke-Restore {
     }
 
     try {
-        $archivePathWsl = ConvertTo-WslPath -WindowsPath $ArchivePath
-
-        # リストア先ディレクトリの作成
-        wsl -d $WslDistro -e mkdir -p $RestoreTarget
-
-        # アーカイブの展開
-        wsl -d $WslDistro -e tar -xzf $archivePathWsl -C $RestoreTarget
-
-        if ($LASTEXITCODE -eq 0) {
+        if ($isZip) {
+            if (-not (Test-Path $RestoreTarget)) {
+                New-Item -ItemType Directory -Force -Path $RestoreTarget | Out-Null
+            }
+            Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+            [System.IO.Compression.ZipFile]::ExtractToDirectory($ArchivePath, $RestoreTarget)
             Write-Host 'Restore completed successfully!' -ForegroundColor Green
             return $true
         } else {
-            Write-Host "Restore failed with exit code: $LASTEXITCODE" -ForegroundColor Red
-            return $false
+            $archivePathWsl = ConvertTo-WslPath -WindowsPath $ArchivePath
+            wsl -d $WslDistro -e mkdir -p $RestoreTarget
+            wsl -d $WslDistro -e tar -xzf $archivePathWsl -C $RestoreTarget
+
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host 'Restore completed successfully!' -ForegroundColor Green
+                return $true
+            } else {
+                Write-Host "Restore failed with exit code: $LASTEXITCODE" -ForegroundColor Red
+                return $false
+            }
         }
     } catch {
         Write-Host "Restore failed: $_" -ForegroundColor Red
@@ -1504,7 +1829,9 @@ function Show-AvailableArchives {
 
     Write-Host "`n=== Available Archives ===" -ForegroundColor Cyan
 
-    $archives = Get-ChildItem $ArchiveDest -Filter '*.tar.gz*' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending
+    $archives = Get-ChildItem $ArchiveDest -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '\.(tar\.gz|zip)$' } |
+        Sort-Object LastWriteTime -Descending
 
     if ($archives.Count -eq 0) {
         Write-Host "No archives found in $ArchiveDest" -ForegroundColor Yellow
@@ -1681,7 +2008,9 @@ function Remove-OldArchives {
     $deletedSize = 0
 
     if ($KeepCount -gt 0) {
-        $all = Get-ChildItem $ArchiveDest -Filter '*.tar.gz*' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending
+        $all = Get-ChildItem $ArchiveDest -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '\.(tar\.gz|zip)$' } |
+            Sort-Object LastWriteTime -Descending
         $old = $all | Select-Object -Skip $KeepCount
         $deletedCount = ($old | Measure-Object).Count
         $deletedSize = ($old | Measure-Object -Property Length -Sum).Sum / 1MB
@@ -1783,7 +2112,7 @@ function Write-Summary {
     Write-Log 'Step 1 - Mirroring:' 'INFO'
     for ($i = 0; $i -lt $MirrorResults.Count; $i++) {
         $mirrorResult = $MirrorResults[$i]
-        $src = $script:Config.Sources[$i]
+        $src = $script:SourceEntries[$i].Path
         $pad = if ($multiSource) { '    ' } else { '  ' }
         if ($multiSource) {
             Write-Log "  [$($i + 1)] $src" 'INFO'
@@ -1802,7 +2131,7 @@ function Write-Summary {
     } else {
         for ($i = 0; $i -lt $ArchiveResults.Count; $i++) {
             $archiveResult = $ArchiveResults[$i]
-            $src = $script:Config.Sources[$i]
+            $src = $script:SourceEntries[$i].Path
             $pad = if ($multiSource) { '    ' } else { '  ' }
             if ($multiSource) {
                 Write-Log "  [$($i + 1)] $src" 'INFO'
@@ -1856,7 +2185,7 @@ function Write-Summary {
         }
     }
 
-    Write-Log '=== WSL Backup Completed ===' 'INFO'
+    Write-Log "=== $script:BackupModeLabel Completed ===" 'INFO'
     Write-Log "Log file: $script:MainLog" 'INFO'
 }
 
@@ -1892,6 +2221,16 @@ if ($Source) {
     $script:Config.Sources = @($Source)
 }
 
+# ソースエントリの解決（エイリアス対応 + 重複名チェック）
+$resolveResult = Resolve-SourceEntries -Sources $script:Config.Sources
+if (-not $resolveResult.Valid) {
+    foreach ($err in $resolveResult.Errors) {
+        Write-Host "ERROR: $err" -ForegroundColor Red
+    }
+    exit $Script:ExitCodes.ValidationError
+}
+$script:SourceEntries = $resolveResult.Entries
+
 # ============================================================================
 # モード別処理
 # ============================================================================
@@ -1920,9 +2259,9 @@ if ($UnregisterScheduledTask) {
 # 除外パターンテストモード
 if ($TestExclusions) {
     $excludes = Read-MirrorIgnore -IgnoreFilePath (Join-Path $PSScriptRoot '.mirrorignore')
-    foreach ($sourceDir in $script:Config.Sources) {
-        $WslSource = "\\wsl.localhost\$($script:Config.WslDistro)" + ($sourceDir -replace '/', '\')
-        Test-ExclusionPatterns -WslSource $WslSource -Excludes $excludes
+    foreach ($entry in $script:SourceEntries) {
+        $resolvedSource = Resolve-SourcePath -Entry $entry -WslDistro $script:Config.WslDistro
+        Test-ExclusionPatterns -WslSource $resolvedSource -Excludes $excludes
     }
     exit $Script:ExitCodes.Success
 }
@@ -1944,7 +2283,12 @@ if ($Restore) {
     }
 
     if (-not $RestoreTarget) {
-        $RestoreTarget = Read-Host 'Enter restore target path (WSL path, e.g., /home/user/restore)'
+        $isZipRestore = $RestoreArchive -match '\.zip$'
+        if ($isZipRestore) {
+            $RestoreTarget = Read-Host 'Enter restore target path (Windows path, e.g., C:\Users\user\restore)'
+        } else {
+            $RestoreTarget = Read-Host 'Enter restore target path (WSL path, e.g., /home/user/restore)'
+        }
     }
 
     $result = Invoke-Restore -ArchivePath $RestoreArchive -RestoreTarget $RestoreTarget `
@@ -1967,15 +2311,34 @@ if ($script:DryRunMode) {
 }
 
 # ソースパスの検証
-foreach ($sourceDir in $script:Config.Sources) {
-    if (-not (Test-SourcePath -SourcePath $sourceDir -WslDistro $script:Config.WslDistro)) {
-        Write-Host "ERROR: Invalid source path: $sourceDir" -ForegroundColor Red
+foreach ($entry in $script:SourceEntries) {
+    if (-not (Test-SourcePath -SourcePath $entry.Path -SourceType $entry.Type)) {
+        Write-Host "ERROR: Invalid source path: $($entry.Path)" -ForegroundColor Red
         exit $Script:ExitCodes.ValidationError
     }
 }
 
+# モード判定
+$script:HasWslSources = ($script:SourceEntries | Where-Object { $_.Type -eq 'wsl' }).Count -gt 0
+$script:HasWindowsSources = ($script:SourceEntries | Where-Object { $_.Type -eq 'windows' }).Count -gt 0
+
+# WSLソースがある場合、WslDistroが必須
+if ($script:HasWslSources -and [string]::IsNullOrWhiteSpace($script:Config.WslDistro)) {
+    Write-Host 'ERROR: WslDistro is required when using WSL source paths' -ForegroundColor Red
+    exit $Script:ExitCodes.ConfigError
+}
+
+# バックアップモードラベル
+$script:BackupModeLabel = if ($script:HasWslSources -and $script:HasWindowsSources) {
+    'WSL/Windows Backup'
+} elseif ($script:HasWindowsSources) {
+    'Windows Backup'
+} else {
+    'WSL Backup'
+}
+
 # ロックファイルによる二重実行防止
-$lockFilePath = Get-LockFilePath -WslDistro $script:Config.WslDistro
+$lockFilePath = Get-LockFilePath
 if (Test-BackupLock -LockFilePath $lockFilePath) {
     Write-Host 'エラー: バックアップが既に実行中です。' -ForegroundColor Red
     Write-Host "  ロックファイル: $lockFilePath" -ForegroundColor Red
@@ -2049,12 +2412,15 @@ try {
 
     $script:MainLog = Join-Path $script:LogDir "backup_$Timestamp.log"
 
-    Write-Host "WSL Backup v$($Script:Constants.Version): $($script:Config.Sources -join ', ') -> $($script:Config.DestRoot)"
-    Write-Log '=== WSL Backup Started ===' 'INFO'
+    $sourceDisplayPaths = ($script:SourceEntries | ForEach-Object { $_.Path }) -join ', '
+    Write-Host "$script:BackupModeLabel v$($Script:Constants.Version): $sourceDisplayPaths -> $($script:Config.DestRoot)"
+    Write-Log "=== $script:BackupModeLabel Started ===" 'INFO'
     Write-Log "Version: $($Script:Constants.Version)" 'INFO'
-    Write-SecureLog "Sources: $($script:Config.Sources -join ', ')" 'INFO'
+    Write-SecureLog "Sources: $sourceDisplayPaths" 'INFO'
     Write-SecureLog "Destination: $($script:Config.DestRoot)" 'INFO'
-    Write-Log "WSL Distribution: $($script:Config.WslDistro)" 'INFO'
+    if ($script:HasWslSources) {
+        Write-Log "WSL Distribution: $($script:Config.WslDistro)" 'INFO'
+    }
     if ($script:SkipArchiveFlag) {
         Write-Log 'Archive Creation: SKIPPED (via command-line argument)' 'INFO'
     }
@@ -2063,14 +2429,16 @@ try {
     }
     Write-Log "Start Time: $($ScriptStartTime.ToString($Script:Constants.LogDateFormat))" 'INFO'
 
-    # WSLの状態確認
-    Show-Progress -Activity 'WSL Backup' -Status 'Checking WSL health...' -PercentComplete 5
-    Write-Host 'Checking WSL health...' -ForegroundColor Gray
-    if (-not (Test-WslHealth -Distro $script:Config.WslDistro)) {
-        Write-Host "ERROR: WSL is not responding or distribution '$($script:Config.WslDistro)' is not available" -ForegroundColor Red
-        exit $Script:ExitCodes.WslError
+    # WSLの状態確認（WSLソースがある場合のみ）
+    if ($script:HasWslSources) {
+        Show-Progress -Activity $script:BackupModeLabel -Status 'Checking WSL health...' -PercentComplete 5
+        Write-Host 'Checking WSL health...' -ForegroundColor Gray
+        if (-not (Test-WslHealth -Distro $script:Config.WslDistro)) {
+            Write-Host "ERROR: WSL is not responding or distribution '$($script:Config.WslDistro)' is not available" -ForegroundColor Red
+            exit $Script:ExitCodes.WslError
+        }
+        Write-Log 'WSL health check passed' 'INFO'
     }
-    Write-Log 'WSL health check passed' 'INFO'
 
     # タイムアウトチェック
     if (Test-Timeout) {
@@ -2085,10 +2453,10 @@ try {
     }
 
     # ソースディレクトリの確認
-    foreach ($sourceDir in $script:Config.Sources) {
-        $WslSource = "\\wsl.localhost\$($script:Config.WslDistro)" + ($sourceDir -replace '/', '\')
-        if (-not (Test-Path $WslSource)) {
-            Write-Host "ERROR: Source not found: $WslSource" -ForegroundColor Red
+    foreach ($entry in $script:SourceEntries) {
+        $resolvedSource = Resolve-SourcePath -Entry $entry -WslDistro $script:Config.WslDistro
+        if (-not (Test-Path $resolvedSource)) {
+            Write-Host "ERROR: Source not found: $resolvedSource" -ForegroundColor Red
             exit $Script:ExitCodes.SourceNotFound
         }
     }
@@ -2099,7 +2467,7 @@ try {
 
     # ミラーリング処理
     $mirrorResults = @()
-    $totalSources = $script:Config.Sources.Count
+    $totalSources = $script:SourceEntries.Count
     $totalSteps = $totalSources * 2 + 1  # mirror + archive + cleanup
 
     for ($i = 0; $i -lt $totalSources; $i++) {
@@ -2109,14 +2477,15 @@ try {
             exit $Script:ExitCodes.TimeoutError
         }
 
-        $sourceDir = $script:Config.Sources[$i]
-        $sourceName = $sourceDir -replace '.*/', ''
-        $WslSource = "\\wsl.localhost\$($script:Config.WslDistro)" + ($sourceDir -replace '/', '\')
+        $sourceEntry = $script:SourceEntries[$i]
+        $sourceDir = $sourceEntry.Path
+        $sourceName = $sourceEntry.Name
+        $resolvedSource = Resolve-SourcePath -Entry $sourceEntry -WslDistro $script:Config.WslDistro
         $sourceMirrorDest = if ($totalSources -eq 1) { $MirrorDest } else { Join-Path $MirrorDest $sourceName }
 
         $stepNum = $i + 1
         $progress = [math]::Round(($stepNum / $totalSteps) * 100)
-        Show-Progress -Activity 'WSL Backup' -Status "Mirroring $sourceName..." -PercentComplete $progress
+        Show-Progress -Activity $script:BackupModeLabel -Status "Mirroring $sourceName..." -PercentComplete $progress
 
         if ($totalSources -eq 1) {
             Write-Host "[1/3] Mirroring $sourceDir..." -ForegroundColor Cyan
@@ -2128,7 +2497,7 @@ try {
             New-Item -ItemType Directory -Force -Path $sourceMirrorDest -ErrorAction SilentlyContinue | Out-Null
         }
 
-        $mirrorResult = Invoke-Mirroring -WslSource $WslSource -MirrorDest $sourceMirrorDest `
+        $mirrorResult = Invoke-Mirroring -WslSource $resolvedSource -MirrorDest $sourceMirrorDest `
             -Excludes $excludes -Timestamp $Timestamp -ThreadCount $script:Config.ThreadCount `
             -BandwidthLimit $script:Config.BandwidthLimitMbps
         $mirrorResults += $mirrorResult
@@ -2156,12 +2525,14 @@ try {
                 exit $Script:ExitCodes.TimeoutError
             }
 
-            $sourceDir = $script:Config.Sources[$i]
-            $sourceName = $sourceDir -replace '.*/', ''
+            $sourceEntry = $script:SourceEntries[$i]
+            $sourceDir = $sourceEntry.Path
+            $sourceName = $sourceEntry.Name
+            $sourceMirrorDest = if ($totalSources -eq 1) { $MirrorDest } else { Join-Path $MirrorDest $sourceName }
 
             $stepNum = $totalSources + $i + 1
             $progress = [math]::Round(($stepNum / $totalSteps) * 100)
-            Show-Progress -Activity 'WSL Backup' -Status "Creating archive for $sourceName..." -PercentComplete $progress
+            Show-Progress -Activity $script:BackupModeLabel -Status "Creating archive for $sourceName..." -PercentComplete $progress
 
             if ($totalSources -eq 1) {
                 Write-Host "[2/3] Creating archive for $sourceDir..." -ForegroundColor Cyan
@@ -2169,8 +2540,15 @@ try {
                 Write-Host "[2.$($i + 1)/$totalSources] Creating archive for $sourceDir..." -ForegroundColor Cyan
             }
 
-            $archiveResult = New-Archive -WslDistro $script:Config.WslDistro -SourceDir $sourceDir `
-                -ArchiveDest $ArchiveDest -Timestamp $Timestamp -Verify $script:Config.VerifyArchive
+            if ($sourceEntry.Type -eq 'windows') {
+                $archiveResult = New-WindowsArchive -MirrorSource $sourceMirrorDest `
+                    -ArchiveDest $ArchiveDest -Timestamp $Timestamp -Verify $script:Config.VerifyArchive `
+                    -SourceName $sourceName
+            } else {
+                $archiveResult = New-Archive -WslDistro $script:Config.WslDistro -SourceDir $sourceDir `
+                    -ArchiveDest $ArchiveDest -Timestamp $Timestamp -Verify $script:Config.VerifyArchive `
+                    -SourceName $sourceName -Excludes $excludes
+            }
             $archiveResults += $archiveResult
 
             # 履歴に保存
@@ -2188,7 +2566,7 @@ try {
     }
 
     # クリーンアップ
-    Show-Progress -Activity 'WSL Backup' -Status 'Cleanup...' -PercentComplete 95
+    Show-Progress -Activity $script:BackupModeLabel -Status 'Cleanup...' -PercentComplete 95
     Write-Host '[3/3] Cleanup...' -ForegroundColor Cyan
     $cleanupResult = Remove-OldArchives -ArchiveDest $ArchiveDest -KeepCount $script:Config.KeepCount
 
@@ -2216,16 +2594,16 @@ try {
     $message = "Files: $totalFiles, Archives: $([math]::Round($totalSize, 1)) MB"
 
     if ($hasErrors) {
-        Send-BackupNotification -Title 'WSL Backup 完了（警告あり）' -Message $message -Success $false
+        Send-BackupNotification -Title "$script:BackupModeLabel 完了（警告あり）" -Message $message -Success $false
     } else {
-        Send-BackupNotification -Title 'WSL Backup 完了' -Message $message -Success $true
+        Send-BackupNotification -Title "$script:BackupModeLabel 完了" -Message $message -Success $true
     }
 
     exit $Script:ExitCodes.Success
 } catch {
     Write-Host "ERROR: $_" -ForegroundColor Red
     Write-Log "Unhandled error: $_" 'ERROR'
-    Send-BackupNotification -Title 'WSL Backup 失敗' -Message "$_" -Success $false
+    Send-BackupNotification -Title "$script:BackupModeLabel 失敗" -Message "$_" -Success $false
     exit $Script:ExitCodes.MirrorError
 } finally {
     Complete-Progress

@@ -1,4 +1,4 @@
-# WSL バックアップ設定ファイル v2.0
+# WSL バックアップ設定ファイル v2.1
 # このファイルを編集してバックアップ設定をカスタマイズしてください
 @{
     # ============================================================================
@@ -6,11 +6,25 @@
     # ============================================================================
 
     # WSLディストリビューション名（wsl -l -v で確認可能）
+    # WSLソースを使用する場合に必要（Windowsソースのみの場合は不要）
     WslDistro = 'Ubuntu'
 
-    # バックアップソース（複数指定可能）
-    # 単一ディレクトリの場合: Sources = @('/home/aoki/projects')
-    # 複数ディレクトリの場合: Sources = @('/home/aoki/projects', '/home/aoki/.config')
+    # バックアップソース（複数指定可能、WSLパスとWindowsパスの混在OK）
+    # パス形式でモードを自動判定:
+    #   / で始まるパス → WSLソース（tar.gzアーカイブ、権限情報保持）
+    #   C:\ 等で始まるパス → Windowsソース（zipアーカイブ）
+    #
+    # 例:
+    #   WSLのみ:     Sources = @('/home/aoki/projects')
+    #   Windowsのみ: Sources = @('C:\Users\aoki\Documents')
+    #   混在:        Sources = @('/home/aoki/projects', 'D:\Work\data')
+    #
+    # 末尾フォルダ名が重複する場合は Name でエイリアスを指定:
+    #   Sources = @(
+    #       '/home/aoki/projects'
+    #       @{ Path = '/opt/projects'; Name = 'opt-projects' }
+    #       @{ Path = 'D:\Work\projects'; Name = 'win-projects' }
+    #   )
     Sources = @(
         '/home/aoki/projects'
     )

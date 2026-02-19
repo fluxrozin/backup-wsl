@@ -180,6 +180,58 @@ BeforeAll {
         param([string]$SourceDir)
         return ($SourceDir -replace '.*/', '') -replace "'", "'\''"
     }
+
+    function Resolve-SourceEntries {
+        param([array]$Sources)
+
+        $entries = @()
+        $errors = @()
+
+        for ($i = 0; $i -lt $Sources.Count; $i++) {
+            $src = $Sources[$i]
+            if ($src -is [hashtable]) {
+                if (-not $src.Path) {
+                    $errors += "Sources[$i]: hashtable entry must have a 'Path' property"
+                    continue
+                }
+                $path = [string]$src.Path
+                $name = if ($src.Name) { [string]$src.Name } else { $path -replace '.*/', '' }
+                if ($name -notmatch '^[a-zA-Z0-9._-]+$') {
+                    $errors += "Sources[$i]: Name '$name' contains invalid characters (allowed: alphanumeric, dot, underscore, hyphen)"
+                    continue
+                }
+                $entries += @{ Path = $path; Name = $name }
+            } elseif ($src -is [string]) {
+                if (-not $src) {
+                    $errors += "Sources[$i]: empty path"
+                    continue
+                }
+                $name = $src -replace '.*/', ''
+                $entries += @{ Path = $src; Name = $name }
+            } else {
+                $errors += "Sources[$i]: must be a string path or a hashtable with Path and optional Name properties"
+            }
+        }
+
+        if ($entries.Count -gt 1) {
+            $dupes = $entries | ForEach-Object { $_.Name } | Group-Object | Where-Object { $_.Count -gt 1 }
+            if ($dupes) {
+                $dupeDetails = foreach ($dupe in $dupes) {
+                    $conflicting = for ($j = 0; $j -lt $entries.Count; $j++) {
+                        if ($entries[$j].Name -eq $dupe.Name) { $entries[$j].Path }
+                    }
+                    "'$($dupe.Name)' ($($conflicting -join ', '))"
+                }
+                $errors += "Duplicate source names detected: $($dupeDetails -join '; '). Use @{ Path = '...'; Name = '...' } to specify unique aliases."
+            }
+        }
+
+        return @{
+            Valid   = $errors.Count -eq 0
+            Errors  = $errors
+            Entries = $entries
+        }
+    }
 }
 
 AfterAll {
@@ -459,6 +511,100 @@ Describe 'Get-SafeSourceName' {
 
     It 'Escapes single quotes' {
         Get-SafeSourceName -SourceDir "/home/user/project's" | Should -Be "project'\''s"
+    }
+}
+
+Describe 'Resolve-SourceEntries' {
+    Context 'String sources' {
+        It 'Resolves single string source' {
+            $result = Resolve-SourceEntries -Sources @('/home/user/projects')
+            $result.Valid | Should -BeTrue
+            $result.Entries.Count | Should -Be 1
+            $result.Entries[0].Path | Should -Be '/home/user/projects'
+            $result.Entries[0].Name | Should -Be 'projects'
+        }
+
+        It 'Resolves multiple unique string sources' {
+            $result = Resolve-SourceEntries -Sources @('/home/user/projects', '/home/user/.config')
+            $result.Valid | Should -BeTrue
+            $result.Entries.Count | Should -Be 2
+            $result.Entries[0].Name | Should -Be 'projects'
+            $result.Entries[1].Name | Should -Be '.config'
+        }
+    }
+
+    Context 'Hashtable sources' {
+        It 'Resolves hashtable with Path and Name' {
+            $result = Resolve-SourceEntries -Sources @(@{ Path = '/opt/projects'; Name = 'opt-projects' })
+            $result.Valid | Should -BeTrue
+            $result.Entries[0].Path | Should -Be '/opt/projects'
+            $result.Entries[0].Name | Should -Be 'opt-projects'
+        }
+
+        It 'Falls back to folder name when Name is omitted' {
+            $result = Resolve-SourceEntries -Sources @(@{ Path = '/opt/projects' })
+            $result.Valid | Should -BeTrue
+            $result.Entries[0].Name | Should -Be 'projects'
+        }
+
+        It 'Rejects hashtable without Path' {
+            $result = Resolve-SourceEntries -Sources @(@{ Name = 'something' })
+            $result.Valid | Should -BeFalse
+            $result.Errors[0] | Should -Match 'Path'
+        }
+    }
+
+    Context 'Mixed sources' {
+        It 'Resolves mix of string and hashtable sources' {
+            $result = Resolve-SourceEntries -Sources @(
+                '/home/user/projects',
+                @{ Path = '/opt/projects'; Name = 'opt-projects' }
+            )
+            $result.Valid | Should -BeTrue
+            $result.Entries.Count | Should -Be 2
+            $result.Entries[0].Name | Should -Be 'projects'
+            $result.Entries[1].Name | Should -Be 'opt-projects'
+        }
+    }
+
+    Context 'Duplicate detection' {
+        It 'Detects duplicate folder names' {
+            $result = Resolve-SourceEntries -Sources @('/home/user/projects', '/opt/projects')
+            $result.Valid | Should -BeFalse
+            $result.Errors | Should -HaveCount 1
+            $result.Errors[0] | Should -Match 'Duplicate source names'
+            $result.Errors[0] | Should -Match 'projects'
+        }
+
+        It 'Allows resolution via Name alias' {
+            $result = Resolve-SourceEntries -Sources @(
+                '/home/user/projects',
+                @{ Path = '/opt/projects'; Name = 'opt-projects' }
+            )
+            $result.Valid | Should -BeTrue
+        }
+    }
+
+    Context 'Name validation' {
+        It 'Rejects names with invalid characters' {
+            $result = Resolve-SourceEntries -Sources @(@{ Path = '/opt/test'; Name = 'has spaces' })
+            $result.Valid | Should -BeFalse
+            $result.Errors[0] | Should -Match 'invalid characters'
+        }
+
+        It 'Accepts names with dots, underscores, and hyphens' {
+            $result = Resolve-SourceEntries -Sources @(@{ Path = '/opt/test'; Name = 'my_project-v2.0' })
+            $result.Valid | Should -BeTrue
+            $result.Entries[0].Name | Should -Be 'my_project-v2.0'
+        }
+    }
+
+    Context 'Error handling' {
+        It 'Rejects empty string path' {
+            $result = Resolve-SourceEntries -Sources @('')
+            $result.Valid | Should -BeFalse
+            $result.Errors[0] | Should -Match 'empty path'
+        }
     }
 }
 

@@ -5,6 +5,7 @@
 # Python
 .venv/
 __pycache__/
+*_cache/
 *.pyc
 
 # Node.js
