@@ -38,7 +38,7 @@
     バックアップ処理全体のタイムアウト時間（分）を指定します。
 .NOTES
     Windows側から実行
-    Version: 2.0.0
+    Version: 2.1.0
 #>
 
 [CmdletBinding(DefaultParameterSetName = 'Backup')]
@@ -80,6 +80,29 @@ param(
     [Parameter(ParameterSetName = 'Backup')]
     [int]$TimeoutMinutes = 120
 )
+
+# ============================================================================
+# 起動診断（タスクスケジューラーからの実行を追跡）
+# ============================================================================
+
+trap {
+    try {
+        $trapLog = Join-Path $PSScriptRoot 'logs\startup.log'
+        "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | UNHANDLED ERROR | PID=$PID | $_" |
+            Out-File -FilePath $trapLog -Append -Encoding UTF8
+    } catch {}
+    break
+}
+
+try {
+    $startupLogDir = Join-Path $PSScriptRoot 'logs'
+    if (-not (Test-Path $startupLogDir)) {
+        New-Item -ItemType Directory -Force -Path $startupLogDir -ErrorAction SilentlyContinue | Out-Null
+    }
+    $startupLogPath = Join-Path $startupLogDir 'startup.log'
+    "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | START | PID=$PID | Interactive=$([Environment]::UserInteractive) | PSVersion=$($PSVersionTable.PSVersion) | Host=$($Host.Name) | Args=$($MyInvocation.Line)" |
+        Out-File -FilePath $startupLogPath -Append -Encoding UTF8
+} catch {}
 
 # ============================================================================
 # 終了コード定数
@@ -428,14 +451,19 @@ function Test-BackupLock {
         $lockContent = Get-Content $LockFilePath -Raw -ErrorAction Stop | ConvertFrom-Json
         $process = Get-Process -Id $lockContent.PID -ErrorAction SilentlyContinue
 
-        if ($process -and $process.Id -eq $lockContent.PID) {
-            # プロセスが存在し、同じマシンからのロックか確認
-            if ($lockContent.Computer -eq $env:COMPUTERNAME) {
-                return $true
+        if ($process -and $process.Id -eq $lockContent.PID -and
+            $lockContent.Computer -eq $env:COMPUTERNAME) {
+            # PID 再利用を検出するため、プロセス開始時刻も検証する
+            if ($lockContent.ProcessStartTime) {
+                $lockStart = [datetime]::Parse($lockContent.ProcessStartTime)
+                if ([math]::Abs(($process.StartTime - $lockStart).TotalSeconds) -gt 2) {
+                    Remove-Item $LockFilePath -Force -ErrorAction SilentlyContinue
+                    return $false
+                }
             }
+            return $true
         }
 
-        # 古いロックファイルを削除
         Remove-Item $LockFilePath -Force -ErrorAction SilentlyContinue
         return $false
     } catch {
@@ -459,12 +487,14 @@ function New-BackupLock {
                 [System.IO.FileShare]::None
             )
 
+            $currentProcess = Get-Process -Id $PID
             $lockContent = @{
-                PID       = $PID
-                StartTime = (Get-Date).ToString('o')
-                Computer  = $env:COMPUTERNAME
-                User      = $env:USERNAME
-                Version   = $Script:Constants.Version
+                PID              = $PID
+                ProcessStartTime = $currentProcess.StartTime.ToString('o')
+                StartTime        = (Get-Date).ToString('o')
+                Computer         = $env:COMPUTERNAME
+                User             = $env:USERNAME
+                Version          = $Script:Constants.Version
             } | ConvertTo-Json
 
             $bytes = [System.Text.Encoding]::UTF8.GetBytes($lockContent)
@@ -996,6 +1026,47 @@ function Send-WebhookNotification {
 }
 
 # ============================================================================
+# 旧ミラー構造クリーンアップ
+# ============================================================================
+
+function Remove-StaleMirrorItems {
+    param(
+        [string]$MirrorDest,
+        [string[]]$ExpectedSubDirs
+    )
+
+    if (-not (Test-Path $MirrorDest)) { return }
+
+    $expectedSet = [System.Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::OrdinalIgnoreCase
+    )
+    foreach ($name in $ExpectedSubDirs) { $null = $expectedSet.Add($name) }
+
+    $staleItems = Get-ChildItem -Path $MirrorDest -Force -ErrorAction SilentlyContinue |
+        Where-Object { -not $expectedSet.Contains($_.Name) }
+
+    if (-not $staleItems -or $staleItems.Count -eq 0) { return }
+
+    Write-Log "Found $($staleItems.Count) stale item(s) from previous single-source layout" 'INFO'
+
+    if ($script:DryRunMode) {
+        foreach ($item in $staleItems) {
+            Write-Log "[DryRun] Would delete stale mirror item: $($item.FullName)" 'INFO'
+        }
+        return
+    }
+
+    foreach ($item in $staleItems) {
+        try {
+            Remove-Item -Path $item.FullName -Recurse -Force -ErrorAction Stop
+            Write-Log "Deleted stale mirror item: $($item.FullName)" 'INFO'
+        } catch {
+            Write-Log "Failed to delete stale mirror item: $($item.FullName) - $_" 'WARN'
+        }
+    }
+}
+
+# ============================================================================
 # 除外アイテム削除
 # ============================================================================
 
@@ -1276,6 +1347,25 @@ Summary:
 # チェックサム管理
 # ============================================================================
 
+function ConvertTo-Hashtable {
+    param([Parameter(ValueFromPipeline)] $InputObject)
+    process {
+        if ($null -eq $InputObject) { return @{} }
+        if ($InputObject -is [hashtable]) { return $InputObject }
+        if ($InputObject -is [System.Collections.IEnumerable] -and $InputObject -isnot [string]) {
+            return @($InputObject | ForEach-Object { ConvertTo-Hashtable $_ })
+        }
+        if ($InputObject -is [psobject]) {
+            $ht = @{}
+            foreach ($prop in $InputObject.PSObject.Properties) {
+                $ht[$prop.Name] = ConvertTo-Hashtable $prop.Value
+            }
+            return $ht
+        }
+        return $InputObject
+    }
+}
+
 function Get-FileChecksum {
     param([string]$FilePath)
 
@@ -1302,7 +1392,7 @@ function Save-ArchiveChecksum {
     try {
         $checksums = @{}
         if (Test-Path $checksumFile) {
-            $checksums = Get-Content $checksumFile -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable
+            $checksums = Get-Content $checksumFile -Raw -Encoding UTF8 | ConvertFrom-Json | ConvertTo-Hashtable
         }
 
         $archiveName = Split-Path $ArchivePath -Leaf
@@ -1336,7 +1426,7 @@ function Test-ArchiveChecksum {
     }
 
     try {
-        $checksums = Get-Content $checksumFile -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable
+        $checksums = Get-Content $checksumFile -Raw -Encoding UTF8 | ConvertFrom-Json | ConvertTo-Hashtable
         $archiveName = Split-Path $ArchivePath -Leaf
 
         if ($checksums[$archiveName]) {
@@ -1364,7 +1454,7 @@ function Get-BackupHistory {
     }
 
     try {
-        return Get-Content $HistoryPath -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable
+        return Get-Content $HistoryPath -Raw -Encoding UTF8 | ConvertFrom-Json | ConvertTo-Hashtable
     } catch {
         return @{ Backups = @() }
     }
@@ -1578,7 +1668,7 @@ function New-Archive {
         }
     }
 
-    $tarCmd = "GZIP=-6 tar -czf '$archivePathWsl'$excludeArgs --ignore-failed-read -C '$safeParentDir' '$safeFolderName' 2>'$tarErrorLogWsl'"
+    $tarCmd = "tar --use-compress-program='gzip -6' -cf '$archivePathWsl'$excludeArgs --ignore-failed-read -C '$safeParentDir' '$safeFolderName' 2>'$tarErrorLogWsl'"
 
     Invoke-WithRetry -OperationName 'Archive creation' -MaxRetries 2 -DelaySeconds 3 -ScriptBlock {
         wsl -d $WslDistro -e bash -c $tarCmd
@@ -1842,7 +1932,7 @@ function Show-AvailableArchives {
     $checksums = @{}
     if (Test-Path $ChecksumFile) {
         try {
-            $checksums = Get-Content $ChecksumFile -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable
+            $checksums = Get-Content $ChecksumFile -Raw -Encoding UTF8 | ConvertFrom-Json | ConvertTo-Hashtable
         } catch { }
     }
 
@@ -1894,8 +1984,14 @@ function Register-BackupScheduledTask {
             Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
         }
 
-        $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
-            -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$ScriptPath`""
+        $pwshPath = (Get-Command pwsh -ErrorAction SilentlyContinue).Source
+        if (-not $pwshPath) {
+            $pwshPath = 'powershell.exe'
+            Write-Host '  Note: pwsh not found, falling back to powershell.exe' -ForegroundColor Yellow
+        }
+
+        $action = New-ScheduledTaskAction -Execute $pwshPath `
+            -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$ScriptPath`""
 
         $trigger = New-ScheduledTaskTrigger -Daily -At $ScheduleTime
 
@@ -1906,17 +2002,20 @@ function Register-BackupScheduledTask {
             -DontStopIfGoingOnBatteries `
             -ExecutionTimeLimit (New-TimeSpan -Hours 4)
 
-        $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+        $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+        $principal = New-ScheduledTaskPrincipal -UserId $currentUser `
+            -LogonType S4U -RunLevel Highest
 
         Register-ScheduledTask -TaskName $taskName `
             -Action $action `
             -Trigger $trigger `
             -Settings $settings `
             -Principal $principal `
-            -Description 'WSL Backup - Daily backup of WSL directories to Windows' | Out-Null
+            -Description 'WSL/Windows Backup - Daily backup (requires user account for WSL access)' | Out-Null
 
         Write-Host "Scheduled task '$taskName' registered successfully!" -ForegroundColor Green
         Write-Host "  Schedule: Daily at $ScheduleTime" -ForegroundColor Gray
+        Write-Host "  User: $currentUser" -ForegroundColor Gray
         Write-Host "  Script: $ScriptPath" -ForegroundColor Gray
 
         return $true
@@ -2196,6 +2295,22 @@ function Write-Summary {
 # グローバル変数の初期化
 $script:DryRunMode = $DryRun.IsPresent
 
+# タスクスケジューラ等の非対話実行時に早期エラーを診断するためのトランスクリプト
+$script:EarlyTranscript = $null
+if (-not [Environment]::UserInteractive -or
+    [System.Security.Principal.WindowsIdentity]::GetCurrent().IsSystem) {
+    try {
+        $transcriptDir = Join-Path $PSScriptRoot 'logs'
+        if (-not (Test-Path $transcriptDir)) {
+            New-Item -ItemType Directory -Force -Path $transcriptDir | Out-Null
+        }
+        $script:EarlyTranscript = Join-Path $transcriptDir "transcript_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+        Start-Transcript -Path $script:EarlyTranscript -Append | Out-Null
+    } catch {
+        # トランスクリプト開始に失敗しても続行
+    }
+}
+
 # 設定ファイルの読み込み
 $configPath = Join-Path $PSScriptRoot $Script:Constants.ConfigFileName
 
@@ -2303,6 +2418,15 @@ if ($Restore) {
 
 $script:SkipArchiveFlag = $SkipArchive.IsPresent
 
+# ログの早期初期化（ロックチェック等の早期終了でもログを記録するため）
+$Timestamp = Get-Date -Format $Script:Constants.TimestampFormat
+$ScriptStartTime = Get-Date
+$script:LogDir = Join-Path $PSScriptRoot 'logs'
+if (-not $script:DryRunMode) {
+    New-Item -ItemType Directory -Force -Path $script:LogDir -ErrorAction SilentlyContinue | Out-Null
+    $script:MainLog = Join-Path $script:LogDir "backup_$Timestamp.log"
+}
+
 # ドライランモードの表示
 if ($script:DryRunMode) {
     Write-Host '=== DRY RUN MODE ===' -ForegroundColor Magenta
@@ -2340,6 +2464,7 @@ $script:BackupModeLabel = if ($script:HasWslSources -and $script:HasWindowsSourc
 # ロックファイルによる二重実行防止
 $lockFilePath = Get-LockFilePath
 if (Test-BackupLock -LockFilePath $lockFilePath) {
+    Write-Log 'Another backup instance is already running (lock file exists)' 'ERROR'
     Write-Host 'エラー: バックアップが既に実行中です。' -ForegroundColor Red
     Write-Host "  ロックファイル: $lockFilePath" -ForegroundColor Red
     exit $Script:ExitCodes.LockError
@@ -2373,6 +2498,7 @@ if (-not (Test-Administrator)) {
             exit $Script:ExitCodes.PermissionError
         }
     } elseif ($needsAdmin) {
+        Write-Log 'Administrator privileges required but auto-elevation is disabled' 'ERROR'
         Write-Host 'エラー: 管理者権限が必要ですが、自動昇格が無効です。' -ForegroundColor Red
         exit $Script:ExitCodes.PermissionError
     }
@@ -2387,15 +2513,11 @@ if (-not $script:DryRunMode) {
 }
 
 try {
-    $Timestamp = Get-Date -Format $Script:Constants.TimestampFormat
-    $ScriptStartTime = Get-Date
-
     # タイムアウト初期化
     Initialize-Timeout -Minutes $TimeoutMinutes
 
     $MirrorDest = Join-Path $script:Config.DestRoot 'mirror'
     $ArchiveDest = Join-Path $script:Config.DestRoot 'archive'
-    $script:LogDir = Join-Path $PSScriptRoot 'logs'
     $historyPath = Join-Path $ArchiveDest $Script:Constants.HistoryFileName
 
     # ディレクトリ作成
@@ -2410,7 +2532,11 @@ try {
         }
     }
 
-    $script:MainLog = Join-Path $script:LogDir "backup_$Timestamp.log"
+    # メインログが有効になったのでトランスクリプトを停止
+    if ($script:EarlyTranscript) {
+        try { Stop-Transcript | Out-Null } catch {}
+        $script:EarlyTranscript = $null
+    }
 
     $sourceDisplayPaths = ($script:SourceEntries | ForEach-Object { $_.Path }) -join ', '
     Write-Host "$script:BackupModeLabel v$($Script:Constants.Version): $sourceDisplayPaths -> $($script:Config.DestRoot)"
@@ -2469,6 +2595,11 @@ try {
     $mirrorResults = @()
     $totalSources = $script:SourceEntries.Count
     $totalSteps = $totalSources * 2 + 1  # mirror + archive + cleanup
+
+    if ($totalSources -gt 1 -and (Test-Path $MirrorDest)) {
+        $expectedSubDirs = $script:SourceEntries | ForEach-Object { $_.Name }
+        Remove-StaleMirrorItems -MirrorDest $MirrorDest -ExpectedSubDirs $expectedSubDirs
+    }
 
     for ($i = 0; $i -lt $totalSources; $i++) {
         # タイムアウトチェック
@@ -2612,4 +2743,16 @@ try {
     if (-not $script:DryRunMode) {
         Remove-BackupLock -LockFilePath $lockFilePath
     }
+
+    # トランスクリプトが残っていれば停止
+    if ($script:EarlyTranscript) {
+        try { Stop-Transcript | Out-Null } catch {}
+    }
+
+    # 終了診断
+    try {
+        $startupLogPath = Join-Path $PSScriptRoot 'logs\startup.log'
+        "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | END   | PID=$PID | ExitCode=$LASTEXITCODE | MainLog=$($script:MainLog)" |
+            Out-File -FilePath $startupLogPath -Append -Encoding UTF8
+    } catch {}
 }

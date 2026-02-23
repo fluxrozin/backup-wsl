@@ -1,0 +1,6 @@
+{
+    "files.encoding": "utf8bom",
+    "[powershell]": {
+        "files.encoding": "utf8bom"
+    }
+}

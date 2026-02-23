@@ -1,4 +1,4 @@
-# WSL バックアップ設定ファイル v2.1
+﻿# WSL バックアップ設定ファイル v2.1
 # このファイルを編集してバックアップ設定をカスタマイズしてください
 @{
     # ============================================================================
@@ -7,7 +7,7 @@
 
     # WSLディストリビューション名（wsl -l -v で確認可能）
     # WSLソースを使用する場合に必要（Windowsソースのみの場合は不要）
-    WslDistro = 'Ubuntu'
+    WslDistro            = 'Ubuntu'
 
     # バックアップソース（複数指定可能、WSLパスとWindowsパスの混在OK）
     # パス形式でモードを自動判定:
@@ -25,22 +25,23 @@
     #       @{ Path = '/opt/projects'; Name = 'opt-projects' }
     #       @{ Path = 'D:\Work\projects'; Name = 'win-projects' }
     #   )
-    Sources = @(
-        '/home/aoki/projects'
+    Sources              = @(
+        @{ Path = '/home/aoki/projects'; Name = 'projects-wsl' }
+        @{ Path = 'C:\Users\aoki\Projects'; Name = 'projects-win' }
     )
 
     # Windows側のバックアップ先ルートディレクトリ
-    DestRoot = 'C:\Users\aoki\Dropbox\Projects_wsl'
+    DestRoot             = 'C:\Users\aoki\Dropbox\Projects_bak'
 
     # ============================================================================
     # 保持設定
     # ============================================================================
 
     # アーカイブを保持する個数（0 = すべて保持）
-    KeepCount = 15
+    KeepCount            = 10
 
     # ログファイルを保持する個数（0 = すべて保持）
-    LogKeepCount = 30
+    LogKeepCount         = 10
 
     # ============================================================================
     # 実行設定
@@ -49,39 +50,39 @@
     # 管理者権限が必要な場合、自動的に昇格するか
     # $true = UACダイアログを表示して昇格
     # $false = 昇格しない、エラーで終了
-    AutoElevate = $true
+    AutoElevate          = $true
 
     # robocopyのスレッド数（0 = 自動、CPUコア数に基づいて決定）
-    ThreadCount = 0
+    ThreadCount          = 0
 
     # 帯域制限（Mbps）（0 = 無制限）
     # ネットワークドライブへのバックアップ時に有用
-    BandwidthLimitMbps = 0
+    BandwidthLimitMbps   = 0
 
     # ============================================================================
     # ディスク・検証設定
     # ============================================================================
 
     # 必要な空きディスク容量（GB）（0 = チェックしない）
-    RequiredFreeSpaceGB = 10
+    RequiredFreeSpaceGB  = 10
 
     # アーカイブ作成後に整合性検証を行うか
-    VerifyArchive = $true
+    VerifyArchive        = $true
 
     # チェックサムを保存するか（SHA256）
-    SaveChecksums = $true
+    SaveChecksums        = $true
 
     # ============================================================================
     # 通知設定
     # ============================================================================
 
     # バックアップ完了時にWindows通知を表示するか
-    ShowNotification = $true
+    ShowNotification     = $true
 
     # Webhook通知URL（Slack、Discord、Teams等）
     # 空の場合は通知しない
     # Slack例: 'https://hooks.slack.com/services/xxx/yyy/zzz'
-    NotificationWebhook = ''
+    NotificationWebhook  = ''
 
     # ============================================================================
     # レポート設定
